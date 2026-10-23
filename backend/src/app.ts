@@ -23,11 +23,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Assignment-only OTP store. In production use Redis and a carrier SMS gateway.
-const otpStore = new Map<string, { code: string; expiresAt: number; attempts: number }>();
-const OTP_TTL_MS = 5 * 60 * 1000;
-const MAX_ATTEMPTS = 5;
-const phoneSchema = z.string().regex(/^[6-9]\d{9}$/, "Enter a valid 10-digit Indian mobile number");
+import { requestOtp, verifyOtp, phoneSchema, otpCodeSchema } from "./otp.js";
 
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -39,28 +35,36 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-app.post("/api/auth/send-otp", (req, res) => {
+const handleRequestOtp = (req: express.Request, res: express.Response) => {
   const parsed = z.object({ phone: phoneSchema }).safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid phone number" });
     return;
   }
-  const phone = parsed.data.phone;
-  const code = String(Math.floor(100000 + Math.random() * 900000));
-  otpStore.set(phone, { code, expiresAt: Date.now() + OTP_TTL_MS, attempts: 0 });
-  console.info(`\n======================================================`);
-  console.info(`[MiniLedger OTP] Mobile: ${phone} | Code: ${code} (Valid for 5m)`);
-  console.info(`======================================================\n`);
+  const result = requestOtp(parsed.data.phone);
+  if (!result.success) {
+    res.status(result.status).json({
+      error: result.error,
+      retryAfterSeconds: result.retryAfterSeconds,
+    });
+    return;
+  }
   res.json({
     message: "OTP generated. Check the backend terminal in this demo.",
-    expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
+    expiresInSeconds: result.expiresInSeconds,
   });
-});
+};
+
+// POST /api/auth/request-otp (Phase 3 requirement)
+app.post("/api/auth/request-otp", handleRequestOtp);
+
+// POST /api/auth/send-otp (Backwards-compatible alias for existing mobile client)
+app.post("/api/auth/send-otp", handleRequestOtp);
 
 app.post("/api/auth/verify-otp", async (req, res) => {
   const parsed = z.object({
     phone: phoneSchema,
-    otp: z.string().regex(/^\d{6}$/, "OTP must be six digits"),
+    otp: otpCodeSchema,
   }).safeParse(req.body);
 
   if (!parsed.success) {
@@ -69,25 +73,19 @@ app.post("/api/auth/verify-otp", async (req, res) => {
   }
 
   const { phone, otp } = parsed.data;
-  const record = otpStore.get(phone);
-  if (!record || Date.now() > record.expiresAt) {
-    otpStore.delete(phone);
-    res.status(400).json({ error: "OTP missing or expired. Request a new OTP." });
-    return;
-  }
-  if (record.attempts >= MAX_ATTEMPTS) {
-    otpStore.delete(phone);
-    res.status(429).json({ error: "Too many attempts. Request a new OTP." });
-    return;
-  }
-  record.attempts += 1;
-  if (record.code !== otp) {
-    res.status(400).json({ error: "Incorrect OTP" });
+  const verification = verifyOtp(phone, otp);
+  if (!verification.success) {
+    res.status(verification.status).json({ error: verification.error });
     return;
   }
 
-  otpStore.delete(phone);
-  const user = await prisma.user.upsert({ where: { phone }, update: {}, create: { phone } });
+  // Find or create User in Supabase PostgreSQL through Prisma
+  const user = await prisma.user.upsert({
+    where: { phone },
+    update: {},
+    create: { phone },
+  });
+
   res.json({
     token: signToken(user.id),
     user: { id: user.id, phone: user.phone },
@@ -130,7 +128,8 @@ app.post("/api/loans", requireAuth, async (req: AuthRequest, res) => {
 });
 
 app.patch("/api/loans/:id/repay", requireAuth, async (req: AuthRequest, res) => {
-  const existing = await prisma.loan.findFirst({ where: { id: req.params.id, userId: req.userId! } });
+  const loanId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const existing = await prisma.loan.findFirst({ where: { id: loanId, userId: req.userId! } });
   if (!existing) {
     res.status(404).json({ error: "Loan not found" });
     return;
