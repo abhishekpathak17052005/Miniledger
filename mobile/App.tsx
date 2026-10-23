@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -17,7 +17,19 @@ import {
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { StatusBar } from "expo-status-bar";
 
-const API_URL = (process.env.EXPO_PUBLIC_API_URL || "http://localhost:4000").replace(/\/$/, "");
+const getDefaultApiUrl = (): string => {
+  if (process.env.EXPO_PUBLIC_API_URL) {
+    return process.env.EXPO_PUBLIC_API_URL.replace(/\/$/, "");
+  }
+  // Android emulator connects to host machine via 10.0.2.2
+  if (Platform.OS === "android") {
+    return "http://10.0.2.2:4000";
+  }
+  // Web & iOS Simulator connect to localhost
+  return "http://localhost:4000";
+};
+
+const API_URL = getDefaultApiUrl();
 
 type Loan = {
   id: string;
@@ -38,19 +50,40 @@ type Summary = {
 
 type FilterType = "ALL" | "PENDING" | "OVERDUE" | "REPAID";
 
+interface ApiError extends Error {
+  status?: number;
+  retryAfterSeconds?: number;
+}
+
 async function api<T>(path: string, token?: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(init.headers || {}),
-    },
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(init.headers || {}),
+      },
+    });
+  } catch {
+    const err: ApiError = new Error(
+      `Cannot connect to MiniLedger backend at ${API_URL}. Ensure the server is running.`
+    );
+    throw err;
+  }
 
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(body.error || `Request failed with status ${response.status}`);
+    const message =
+      body.error ||
+      (response.status === 429
+        ? "Too many requests. Please wait a moment before trying again."
+        : `Request failed with status ${response.status}`);
+    const err: ApiError = new Error(message);
+    err.status = response.status;
+    err.retryAfterSeconds = body.retryAfterSeconds;
+    throw err;
   }
   return body as T;
 }
@@ -69,11 +102,17 @@ const addDaysToDate = (days: number): string => {
   return date.toISOString().slice(0, 10);
 };
 
+const normalizePhone = (raw: string): string =>
+  raw.trim().replace(/[\s-]/g, "").replace(/^(\+91|0)/, "");
+
 export default function App() {
   const [token, setToken] = useState<string | null>(null);
+  const [userPhone, setUserPhone] = useState<string>("");
   const [phone, setPhone] = useState("");
   const [otp, setOtp] = useState("");
   const [otpSent, setOtpSent] = useState(false);
+  const [cooldown, setCooldown] = useState(0);
+
   const [loans, setLoans] = useState<Loan[]>([]);
   const [summary, setSummary] = useState<Summary>({
     totalLent: 0,
@@ -94,14 +133,47 @@ export default function App() {
 
   // Interaction states
   const [busy, setBusy] = useState(false);
+  const [repayingId, setRepayingId] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
+  const [successMessage, setSuccessMessage] = useState("");
+
+  const cooldownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Cooldown countdown tick
+  useEffect(() => {
+    if (cooldown > 0) {
+      cooldownTimerRef.current = setInterval(() => {
+        setCooldown((prev) => {
+          if (prev <= 1) {
+            if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+    return () => {
+      if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
+    };
+  }, [cooldown]);
+
+  // Auto-dismiss success messages after 4 seconds
+  useEffect(() => {
+    if (!successMessage) return;
+    const timer = setTimeout(() => setSuccessMessage(""), 4000);
+    return () => clearTimeout(timer);
+  }, [successMessage]);
 
   useEffect(() => {
     void (async () => {
       try {
-        const saved = await AsyncStorage.getItem("miniledger_token");
-        if (saved) setToken(saved);
+        const savedToken = await AsyncStorage.getItem("miniledger_token");
+        const savedPhone = await AsyncStorage.getItem("miniledger_phone");
+        if (savedToken) {
+          setToken(savedToken);
+          if (savedPhone) setUserPhone(savedPhone);
+        }
       } catch {
         // ignore storage read issues
       }
@@ -130,48 +202,66 @@ export default function App() {
     }
   }
 
-  async function sendOtp() {
-    if (!phone || phone.length < 10) {
-      setError("Please enter a valid 10-digit mobile number");
+  async function requestOtpCode() {
+    const normalized = normalizePhone(phone);
+    if (!/^[6-9]\d{9}$/.test(normalized)) {
+      setError("Please enter a valid 10-digit Indian mobile number (e.g. 9876543210)");
       return;
     }
+
     setBusy(true);
     setError("");
     try {
-      await api("/api/auth/send-otp", undefined, {
-        method: "POST",
-        body: JSON.stringify({ phone }),
-      });
-      setOtpSent(true);
-      Alert.alert(
-        "Mock OTP Dispatched",
-        "For demo purposes, check the backend terminal output to view the 6-digit OTP code."
+      const res = await api<{ message: string; expiresInSeconds?: number }>(
+        "/api/auth/request-otp",
+        undefined,
+        {
+          method: "POST",
+          body: JSON.stringify({ phone: normalized }),
+        }
       );
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not send OTP");
+      setOtpSent(true);
+      setCooldown(60);
+      setSuccessMessage("OTP generated! Check your backend terminal console.");
+      Alert.alert(
+        "Mock OTP Generated",
+        res.message || "Check the backend terminal console to view your 6-digit OTP code."
+      );
+    } catch (e: any) {
+      const retrySec = e?.retryAfterSeconds;
+      if (retrySec && typeof retrySec === "number") {
+        setCooldown(retrySec);
+      }
+      setError(e instanceof Error ? e.message : "Could not request OTP");
     } finally {
       setBusy(false);
     }
   }
 
-  async function verifyOtp() {
-    if (!otp || otp.length !== 6) {
+  async function verifyOtpCode() {
+    const normalized = normalizePhone(phone);
+    const cleanOtp = otp.trim();
+    if (!/^\d{6}$/.test(cleanOtp)) {
       setError("Please enter the 6-digit OTP code");
       return;
     }
+
     setBusy(true);
     setError("");
     try {
-      const result = await api<{ token: string; user?: { id: string; phone: string } }>(
+      const result = await api<{ token: string; user: { id: string; phone: string } }>(
         "/api/auth/verify-otp",
         undefined,
         {
           method: "POST",
-          body: JSON.stringify({ phone, otp }),
+          body: JSON.stringify({ phone: normalized, otp: cleanOtp }),
         }
       );
       await AsyncStorage.setItem("miniledger_token", result.token);
+      await AsyncStorage.setItem("miniledger_phone", result.user.phone);
+      setUserPhone(result.user.phone);
       setToken(result.token);
+      setSuccessMessage("Logged in successfully!");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not verify OTP");
     } finally {
@@ -180,13 +270,24 @@ export default function App() {
   }
 
   async function addLoan() {
+    const trimmedName = friendName.trim();
     const numericAmount = Number(amount);
-    if (!friendName.trim()) {
+
+    if (!trimmedName) {
       setError("Please enter your friend's name.");
       return;
     }
+    if (trimmedName.length > 80) {
+      setError("Friend name cannot exceed 80 characters.");
+      return;
+    }
     if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-      setError("Please enter an amount greater than ₹0.");
+      setError("Please enter a positive loan amount greater than ₹0.");
+      return;
+    }
+    const decimalParts = amount.includes(".") ? amount.split(".")[1] : "";
+    if (decimalParts.length > 2) {
+      setError("Amount cannot have more than 2 decimal places.");
       return;
     }
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || Number.isNaN(Date.parse(`${dueDate}T00:00:00Z`))) {
@@ -200,7 +301,7 @@ export default function App() {
       await api("/api/loans", token!, {
         method: "POST",
         body: JSON.stringify({
-          friendName: friendName.trim(),
+          friendName: trimmedName,
           amount: numericAmount,
           dueDate,
         }),
@@ -209,6 +310,7 @@ export default function App() {
       setAmount("");
       setDueDate(addDaysToDate(7));
       setShowForm(false);
+      setSuccessMessage(`Loan of ${rupees(numericAmount)} to ${trimmedName} recorded!`);
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not add loan");
@@ -218,6 +320,7 @@ export default function App() {
   }
 
   function confirmRepayment(loan: Loan) {
+    if (busy || repayingId) return;
     Alert.alert(
       "Confirm Repayment",
       `Mark loan of ${rupees(loan.amount)} to ${loan.friendName} as fully repaid?`,
@@ -233,30 +336,37 @@ export default function App() {
   }
 
   async function executeRepay(loan: Loan) {
-    setBusy(true);
+    if (repayingId) return;
+    setRepayingId(loan.id);
+    setError("");
     try {
       await api(`/api/loans/${loan.id}/repay`, token!, { method: "PATCH" });
+      setSuccessMessage(`Loan to ${loan.friendName} marked as repaid!`);
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not mark loan as repaid");
     } finally {
-      setBusy(false);
+      setRepayingId(null);
     }
   }
 
   async function logout() {
-    Alert.alert("Log Out", "Are you sure you want to log out?", [
+    Alert.alert("Log Out", "Are you sure you want to log out of MiniLedger?", [
       { text: "Cancel", style: "cancel" },
       {
         text: "Log Out",
         style: "destructive",
         onPress: async () => {
-          await AsyncStorage.removeItem("miniledger_token");
+          await AsyncStorage.multiRemove(["miniledger_token", "miniledger_phone"]);
           setToken(null);
+          setUserPhone("");
           setPhone("");
           setOtp("");
           setOtpSent(false);
+          setCooldown(0);
           setLoans([]);
+          setError("");
+          setSuccessMessage("");
         },
       },
     ]);
@@ -319,17 +429,20 @@ export default function App() {
             <Text style={styles.heading}>{otpSent ? "Verify Mobile OTP" : "Welcome to MiniLedger"}</Text>
             <Text style={styles.helperText}>
               {otpSent
-                ? `Enter the 6-digit code printed in the server terminal for ${phone}`
-                : "Enter your 10-digit mobile number to log in or create an account."}
+                ? `Enter the 6-digit code printed in the backend terminal for ${phone}`
+                : "Enter your 10-digit Indian mobile number to log in or create an account."}
             </Text>
 
             <Text style={styles.label}>MOBILE NUMBER</Text>
             <TextInput
               style={styles.input}
               value={phone}
-              onChangeText={setPhone}
+              onChangeText={(t) => {
+                setPhone(t);
+                if (error) setError("");
+              }}
               keyboardType="phone-pad"
-              maxLength={10}
+              maxLength={13}
               placeholder="e.g. 9876543210"
               placeholderTextColor="#A0AEC0"
               editable={!otpSent && !busy}
@@ -341,7 +454,10 @@ export default function App() {
                 <TextInput
                   style={[styles.input, styles.otpInput]}
                   value={otp}
-                  onChangeText={setOtp}
+                  onChangeText={(t) => {
+                    setOtp(t);
+                    if (error) setError("");
+                  }}
                   keyboardType="number-pad"
                   maxLength={6}
                   placeholder="6-digit OTP"
@@ -352,11 +468,12 @@ export default function App() {
             )}
 
             {!!error && <Text style={styles.error}>{error}</Text>}
+            {!!successMessage && <Text style={styles.successBanner}>{successMessage}</Text>}
 
             <Pressable
               style={[styles.primary, busy && styles.buttonDisabled]}
               disabled={busy}
-              onPress={() => void (otpSent ? verifyOtp() : sendOtp())}
+              onPress={() => void (otpSent ? verifyOtpCode() : requestOtpCode())}
             >
               {busy ? (
                 <ActivityIndicator color="white" />
@@ -368,23 +485,36 @@ export default function App() {
             </Pressable>
 
             {otpSent && (
-              <Pressable
-                style={styles.changePhoneButton}
-                onPress={() => {
-                  setOtpSent(false);
-                  setOtp("");
-                  setError("");
-                }}
-              >
-                <Text style={styles.link}>← Change mobile number</Text>
-              </Pressable>
+              <View style={styles.otpActionsRow}>
+                <Pressable
+                  style={[styles.resendButton, (busy || cooldown > 0) && styles.buttonDisabled]}
+                  disabled={busy || cooldown > 0}
+                  onPress={() => void requestOtpCode()}
+                >
+                  <Text style={[styles.link, cooldown > 0 && styles.linkMuted]}>
+                    {cooldown > 0 ? `Resend OTP in ${cooldown}s` : "↻ Resend OTP"}
+                  </Text>
+                </Pressable>
+
+                <Pressable
+                  style={styles.changePhoneButton}
+                  onPress={() => {
+                    setOtpSent(false);
+                    setOtp("");
+                    setError("");
+                    setSuccessMessage("");
+                  }}
+                >
+                  <Text style={styles.link}>← Change number</Text>
+                </Pressable>
+              </View>
             )}
           </View>
 
           <View style={styles.demoNoteCard}>
             <Text style={styles.demoNoteTitle}>Demo Verification Notice</Text>
             <Text style={styles.demoNoteBody}>
-              For this technical assignment, OTPs are printed directly in the backend terminal console.
+              For this technical assignment, OTPs are printed directly in the backend terminal console. Never hardcode an OTP in the application.
             </Text>
           </View>
         </KeyboardAvoidingView>
@@ -399,7 +529,9 @@ export default function App() {
       <View style={styles.topbar}>
         <View>
           <Text style={styles.brandSmall}>MiniLedger</Text>
-          <Text style={styles.subtitleSmall}>Personal Lending Dashboard</Text>
+          <Text style={styles.subtitleSmall}>
+            {userPhone ? `Logged in as +91 ${userPhone}` : "Personal Lending Dashboard"}
+          </Text>
         </View>
         <Pressable style={styles.logoutButton} onPress={() => void logout()}>
           <Text style={styles.logoutText}>Log Out</Text>
@@ -467,7 +599,10 @@ export default function App() {
             <TextInput
               style={styles.input}
               value={friendName}
-              onChangeText={setFriendName}
+              onChangeText={(t) => {
+                setFriendName(t);
+                if (error) setError("");
+              }}
               placeholder="e.g. Riya Sharma"
               placeholderTextColor="#A0AEC0"
               maxLength={80}
@@ -477,7 +612,10 @@ export default function App() {
             <TextInput
               style={styles.input}
               value={amount}
-              onChangeText={setAmount}
+              onChangeText={(t) => {
+                setAmount(t);
+                if (error) setError("");
+              }}
               placeholder="e.g. 1500"
               placeholderTextColor="#A0AEC0"
               keyboardType="decimal-pad"
@@ -487,14 +625,17 @@ export default function App() {
             <TextInput
               style={styles.input}
               value={dueDate}
-              onChangeText={setDueDate}
+              onChangeText={(t) => {
+                setDueDate(t);
+                if (error) setError("");
+              }}
               placeholder="YYYY-MM-DD"
               placeholderTextColor="#A0AEC0"
             />
 
             {/* Quick Date Presets */}
             <View style={styles.presetsRow}>
-              <Text style={styles.presetsLabel}>Quick presets:</Text>
+              <Text style={styles.presetsLabel}>Presets:</Text>
               <Pressable style={styles.presetChip} onPress={() => setDueDate(addDaysToDate(0))}>
                 <Text style={styles.presetText}>Today</Text>
               </Pressable>
@@ -524,6 +665,10 @@ export default function App() {
             </Pressable>
           </View>
         )}
+
+        {/* Global Feedback Banners */}
+        {!!error && <Text style={styles.errorBanner}>{error}</Text>}
+        {!!successMessage && <Text style={styles.successBanner}>{successMessage}</Text>}
 
         {/* Search & Filter Bar */}
         <View style={styles.searchWrap}>
@@ -588,8 +733,6 @@ export default function App() {
           </Pressable>
         </View>
 
-        {!!error && <Text style={styles.errorBanner}>{error}</Text>}
-
         {/* Loans List or Empty State */}
         {filteredLoans.length === 0 ? (
           <View style={styles.empty}>
@@ -610,6 +753,7 @@ export default function App() {
             keyExtractor={(item) => item.id}
             renderItem={({ item }) => {
               const isOverdue = item.status === "PENDING" && item.dueDate < todayStr;
+              const isItemRepaying = repayingId === item.id;
               return (
                 <View
                   style={[
@@ -680,10 +824,18 @@ export default function App() {
 
                     {item.status === "PENDING" && (
                       <Pressable
-                        style={styles.repayButton}
+                        style={[
+                          styles.repayButton,
+                          (busy || repayingId !== null) && styles.buttonDisabled,
+                        ]}
+                        disabled={busy || repayingId !== null}
                         onPress={() => confirmRepayment(item)}
                       >
-                        <Text style={styles.repayButtonText}>Mark Repaid</Text>
+                        {isItemRepaying ? (
+                          <ActivityIndicator size="small" color="#175CD3" />
+                        ) : (
+                          <Text style={styles.repayButtonText}>Mark Repaid</Text>
+                        )}
                       </Pressable>
                     )}
                   </View>
@@ -776,14 +928,32 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     marginTop: 14,
   },
-  buttonDisabled: { opacity: 0.65 },
+  buttonDisabled: { opacity: 0.55 },
   primaryText: { color: "white", fontWeight: "800", fontSize: 15 },
   link: { color: "#1F4FD6", fontWeight: "700", fontSize: 13, textAlign: "center" },
-  changePhoneButton: { marginTop: 14 },
+  linkMuted: { color: "#98A2B3" },
+  otpActionsRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginTop: 14,
+    paddingHorizontal: 4,
+  },
+  resendButton: { paddingVertical: 4 },
+  changePhoneButton: { paddingVertical: 4 },
   error: { color: "#D92D20", fontSize: 13, marginVertical: 6, fontWeight: "600" },
   errorBanner: {
     backgroundColor: "#FEE4E2",
     color: "#B42318",
+    padding: 12,
+    borderRadius: 10,
+    marginBottom: 12,
+    fontWeight: "600",
+    fontSize: 13,
+  },
+  successBanner: {
+    backgroundColor: "#D1FADF",
+    color: "#027A48",
     padding: 12,
     borderRadius: 10,
     marginBottom: 12,
@@ -988,6 +1158,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 5,
     borderRadius: 8,
+    minWidth: 84,
+    alignItems: "center",
   },
   repayButtonText: { color: "#175CD3", fontWeight: "800", fontSize: 12 },
   empty: {
