@@ -361,6 +361,7 @@ describe("Phase 4: Loan Creation & Input Validation (POST /api/loans)", () => {
     expect(createSpy).toHaveBeenCalledWith({
       data: {
         userId,
+        friendId: null,
         friendName: "Riya Sharma",
         amount: "1500.00",
         dueDate: new Date("2026-11-15T00:00:00.000Z"),
@@ -1105,6 +1106,424 @@ describe("Custom Overdue Amount (PATCH /api/loans/:id/overdue)", () => {
       .set("Authorization", `Bearer ${aliceToken}`)
       .send({ customOverdueAmount: 50.123 });
     expect(resDecimals.status).toBe(400);
+  });
+});
+
+describe("Phase 8: Friend Profiles & Lending History", () => {
+  const aliceId = "user-alice";
+  const bobId = "user-bob";
+  const aliceToken = signToken(aliceId);
+  const bobToken = signToken(bobId);
+
+  beforeEach(() => {
+    vi.spyOn(prisma.user as any, "findUnique").mockImplementation(async ({ where }: any) => {
+      return { id: where.id, phone: "9876543210" } as any;
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("creates a new friend profile with normalized name and phone", async () => {
+    const createdFriend = {
+      id: "friend-1",
+      userId: aliceId,
+      name: "Rohit Sharma",
+      normalizedName: "rohit sharma",
+      phone: "+91 98765 43210",
+      normalizedPhone: "9876543210",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    vi.spyOn(prisma.friend as any, "findMany").mockResolvedValueOnce([]); // no duplicates
+    const createSpy = vi.spyOn(prisma.friend as any, "create").mockResolvedValueOnce(createdFriend as any);
+
+    const res = await request(app)
+      .post("/api/friends")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({ name: "  Rohit   Sharma  ", phone: "+91 98765 43210" });
+
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe("friend-1");
+    expect(res.body.name).toBe("Rohit Sharma");
+    expect(createSpy).toHaveBeenCalledWith({
+      data: {
+        userId: aliceId,
+        name: "Rohit Sharma",
+        normalizedName: "rohit sharma",
+        phone: "+91 98765 43210",
+        normalizedPhone: "9876543210",
+      },
+    });
+  });
+
+  it("rejects friend creation when missing or blank name", async () => {
+    const res = await request(app)
+      .post("/api/friends")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({ name: "   " });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("Friend name is required");
+  });
+
+  it("enforces duplicate prevention: rejects duplicate friend name with 409 Conflict", async () => {
+    const existingFriend = {
+      id: "friend-existing",
+      userId: aliceId,
+      name: "Rohit Sharma",
+      normalizedName: "rohit sharma",
+      phone: null,
+      normalizedPhone: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      loans: [],
+    };
+
+    vi.spyOn(prisma.friend as any, "findMany").mockResolvedValueOnce([existingFriend]);
+
+    const res = await request(app)
+      .post("/api/friends")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({ name: "rohit sharma" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("matching friend profile already exists");
+    expect(res.body.matches).toHaveLength(1);
+    expect(res.body.matches[0].id).toBe("friend-existing");
+  });
+
+  it("lists friends scoped to the authenticated user with aggregated metrics", async () => {
+    const friends = [
+      {
+        id: "friend-1",
+        userId: aliceId,
+        name: "Aman",
+        normalizedName: "aman",
+        phone: null,
+        normalizedPhone: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        loans: [
+          {
+            id: "loan-1",
+            amount: new Prisma.Decimal("1000.00"),
+            dueDate: new Date("2026-11-01"),
+            status: "PENDING",
+            customOverdueAmount: null,
+            repayments: [{ amount: new Prisma.Decimal("200.00") }],
+          },
+        ],
+      },
+    ];
+
+    vi.spyOn(prisma.friend as any, "findMany").mockResolvedValueOnce(friends as any);
+
+    const res = await request(app)
+      .get("/api/friends")
+      .set("Authorization", `Bearer ${aliceToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].name).toBe("Aman");
+    expect(res.body[0].totalLent).toBe(1000);
+    expect(res.body[0].totalRepaid).toBe(200);
+    expect(res.body[0].outstandingAmount).toBe(800);
+  });
+
+  it("retrieves full friend profile including loans and repayments", async () => {
+    const friend = {
+      id: "friend-1",
+      userId: aliceId,
+      name: "Aman",
+      normalizedName: "aman",
+      phone: "9876543210",
+      normalizedPhone: "9876543210",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      loans: [
+        {
+          id: "loan-1",
+          userId: aliceId,
+          friendId: "friend-1",
+          friendName: "Aman",
+          amount: new Prisma.Decimal("1000.00"),
+          dueDate: new Date("2026-11-01"),
+          status: "PENDING",
+          createdAt: new Date(),
+          repaidAt: null,
+          customOverdueAmount: null,
+          receiptPath: null,
+          receiptContentType: null,
+          repayments: [
+            {
+              id: "repay-1",
+              loanId: "loan-1",
+              amount: new Prisma.Decimal("200.00"),
+              repaidAt: new Date("2026-10-23T10:00:00Z"),
+              note: "First installment",
+            },
+          ],
+        },
+      ],
+    };
+
+    vi.spyOn(prisma.friend as any, "findFirst").mockResolvedValueOnce(friend as any);
+
+    const res = await request(app)
+      .get("/api/friends/friend-1")
+      .set("Authorization", `Bearer ${aliceToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe("friend-1");
+    expect(res.body.name).toBe("Aman");
+    expect(res.body.loans).toHaveLength(1);
+    expect(res.body.loans[0].repayments).toHaveLength(1);
+    expect(res.body.loans[0].repayments[0].note).toBe("First installment");
+  });
+
+  it("prevents Bob from viewing Alice's friend profile (404 Friend not found)", async () => {
+    vi.spyOn(prisma.friend as any, "findFirst").mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .get("/api/friends/alice-friend-id")
+      .set("Authorization", `Bearer ${bobToken}`);
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Friend not found");
+  });
+
+  it("creates a loan linked to an existing friend profile", async () => {
+    const friend = { id: "friend-1", name: "Riya Sharma" };
+    vi.spyOn(prisma.friend as any, "findFirst").mockResolvedValueOnce(friend as any);
+
+    const loan = {
+      id: "loan-102",
+      userId: aliceId,
+      friendId: "friend-1",
+      friendName: "Riya Sharma",
+      amount: new Prisma.Decimal("2000.00"),
+      dueDate: new Date("2026-11-20"),
+      status: "PENDING",
+      createdAt: new Date(),
+      repaidAt: null,
+      customOverdueAmount: null,
+      receiptPath: null,
+      receiptContentType: null,
+    };
+
+    const createSpy = vi.spyOn(prisma.loan as any, "create").mockResolvedValueOnce(loan as any);
+
+    const res = await request(app)
+      .post("/api/loans")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({
+        friendId: "friend-1",
+        friendName: "Riya Sharma",
+        amount: 2000,
+        dueDate: "2026-11-20",
+      });
+
+    expect(res.status).toBe(201);
+    expect(createSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          friendId: "friend-1",
+          friendName: "Riya Sharma",
+        }),
+      })
+    );
+  });
+
+  it("rejects loan creation when friendId belongs to another user (404)", async () => {
+    vi.spyOn(prisma.friend as any, "findFirst").mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .post("/api/loans")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({
+        friendId: "bob-friend-id",
+        friendName: "Someone",
+        amount: 500,
+        dueDate: "2026-11-20",
+      });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toContain("Friend profile not found");
+  });
+});
+
+describe("Phase 8: Partial Repayments & Repayment History", () => {
+  const aliceId = "user-alice";
+  const bobId = "user-bob";
+  const aliceToken = signToken(aliceId);
+  const bobToken = signToken(bobId);
+
+  beforeEach(() => {
+    vi.spyOn(prisma.user as any, "findUnique").mockImplementation(async ({ where }: any) => {
+      return { id: where.id, phone: "9876543210" } as any;
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("records a partial repayment with note and keeps loan PENDING", async () => {
+    const existingLoan = {
+      id: "loan-partial-1",
+      userId: aliceId,
+      friendName: "Sameer",
+      amount: new Prisma.Decimal("1000.00"),
+      dueDate: new Date("2026-11-20"),
+      status: "PENDING",
+      createdAt: new Date(),
+      repaidAt: null,
+      repayments: [],
+    };
+
+    const createdRepayment = {
+      id: "repay-1",
+      loanId: "loan-partial-1",
+      amount: new Prisma.Decimal("400.00"),
+      repaidAt: new Date("2026-10-23T15:00:00Z"),
+      note: "Cash payment",
+    };
+
+    const updatedLoan = {
+      ...existingLoan,
+      status: "PENDING",
+      repayments: [createdRepayment],
+    };
+
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(existingLoan as any);
+    vi.spyOn(prisma as any, "$transaction").mockImplementation(async (callback: any) => {
+      const tx = {
+        repayment: { create: vi.fn().mockResolvedValue(createdRepayment) },
+        loan: { update: vi.fn().mockResolvedValue({}) },
+      };
+      return callback(tx);
+    });
+    vi.spyOn(prisma.loan as any, "findUnique").mockResolvedValueOnce(updatedLoan as any);
+
+    const res = await request(app)
+      .post("/api/loans/loan-partial-1/repayments")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({ amount: 400, note: "Cash payment" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.loan.status).toBe("PENDING");
+    expect(res.body.repayment.amount).toBe("400.00");
+    expect(res.body.repayment.note).toBe("Cash payment");
+  });
+
+  it("transitions loan to REPAID when repayment completes the balance", async () => {
+    const existingLoan = {
+      id: "loan-full-1",
+      userId: aliceId,
+      friendName: "Sameer",
+      amount: new Prisma.Decimal("1000.00"),
+      dueDate: new Date("2026-11-20"),
+      status: "PENDING",
+      createdAt: new Date(),
+      repaidAt: null,
+      repayments: [{ amount: new Prisma.Decimal("400.00") }],
+    };
+
+    const createdRepayment = {
+      id: "repay-2",
+      loanId: "loan-full-1",
+      amount: new Prisma.Decimal("600.00"),
+      repaidAt: new Date("2026-10-23T16:00:00Z"),
+      note: "Final installment",
+    };
+
+    const fullyRepaidLoan = {
+      ...existingLoan,
+      status: "REPAID",
+      repaidAt: new Date("2026-10-23T16:00:00Z"),
+      repayments: [{ amount: new Prisma.Decimal("400.00") }, createdRepayment],
+    };
+
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(existingLoan as any);
+    vi.spyOn(prisma as any, "$transaction").mockImplementation(async (callback: any) => {
+      const tx = {
+        repayment: { create: vi.fn().mockResolvedValue(createdRepayment) },
+        loan: { update: vi.fn().mockResolvedValue({}) },
+      };
+      return callback(tx);
+    });
+    vi.spyOn(prisma.loan as any, "findUnique").mockResolvedValueOnce(fullyRepaidLoan as any);
+
+    const res = await request(app)
+      .post("/api/loans/loan-full-1/repayments")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({ amount: 600, note: "Final installment" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.loan.status).toBe("REPAID");
+  });
+
+  it("rejects repayment exceeding outstanding balance with 400", async () => {
+    const existingLoan = {
+      id: "loan-partial-1",
+      userId: aliceId,
+      friendName: "Sameer",
+      amount: new Prisma.Decimal("1000.00"),
+      dueDate: new Date("2026-11-20"),
+      status: "PENDING",
+      createdAt: new Date(),
+      repaidAt: null,
+      repayments: [{ amount: new Prisma.Decimal("700.00") }], // 300 remaining
+    };
+
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(existingLoan as any);
+
+    const res = await request(app)
+      .post("/api/loans/loan-partial-1/repayments")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({ amount: 500 }); // 500 > 300
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("Repayment cannot exceed the outstanding balance");
+  });
+
+  it("rejects repayment on already fully repaid loan with 409", async () => {
+    const fullyRepaidLoan = {
+      id: "loan-repaid",
+      userId: aliceId,
+      friendName: "Sameer",
+      amount: new Prisma.Decimal("1000.00"),
+      dueDate: new Date("2026-11-20"),
+      status: "REPAID",
+      createdAt: new Date(),
+      repaidAt: new Date(),
+      repayments: [{ amount: new Prisma.Decimal("1000.00") }],
+    };
+
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(fullyRepaidLoan as any);
+
+    const res = await request(app)
+      .post("/api/loans/loan-repaid/repayments")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({ amount: 100 });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("already fully repaid");
+  });
+
+  it("prevents Bob from repaying Alice's loan (404 Loan not found)", async () => {
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .post("/api/loans/alice-loan/repayments")
+      .set("Authorization", `Bearer ${bobToken}`)
+      .send({ amount: 100 });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Loan not found");
   });
 });
 
