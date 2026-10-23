@@ -18,6 +18,8 @@ build/
 mobile/.expo/
 coverage/
 backend/coverage/
+uploads/
+backend/uploads/
 
 # IDE & OS files
 .DS_Store

@@ -352,6 +352,9 @@ describe("Phase 4: Loan Creation & Input Validation (POST /api/loans)", () => {
       amount: "1500.00",
       dueDate: "2026-11-15",
       status: "PENDING",
+      hasReceipt: false,
+      receiptUrl: null,
+      customOverdueAmount: null,
       createdAt: "2026-10-23T12:00:00.000Z",
       repaidAt: null,
     });
@@ -361,6 +364,9 @@ describe("Phase 4: Loan Creation & Input Validation (POST /api/loans)", () => {
         friendName: "Riya Sharma",
         amount: "1500.00",
         dueDate: new Date("2026-11-15T00:00:00.000Z"),
+        customOverdueAmount: null,
+        receiptPath: null,
+        receiptContentType: null,
       },
     });
   });
@@ -604,13 +610,13 @@ describe("Phase 4: Financial Summary & Overdue Semantics (GET /api/loans/summary
       if (where.status === "REPAID") {
         return { _sum: { amount: new Prisma.Decimal("1500.50") } } as any;
       }
-      if (where.status === "PENDING") {
-        // Overdue pending loans
-        return { _sum: { amount: new Prisma.Decimal("800.25") } } as any;
-      }
       // All loans
       return { _sum: { amount: new Prisma.Decimal("4500.75") } } as any;
     });
+
+    vi.spyOn(prisma.loan as any, "findMany").mockResolvedValueOnce([
+      { amount: new Prisma.Decimal("800.25"), customOverdueAmount: null },
+    ]);
 
     const response = await request(app)
       .get("/api/loans/summary")
@@ -629,6 +635,7 @@ describe("Phase 4: Financial Summary & Overdue Semantics (GET /api/loans/summary
     vi.spyOn(prisma.loan as any, "aggregate").mockResolvedValue({
       _sum: { amount: null },
     } as any);
+    vi.spyOn(prisma.loan as any, "findMany").mockResolvedValueOnce([]);
 
     const response = await request(app)
       .get("/api/loans/summary")
@@ -641,6 +648,27 @@ describe("Phase 4: Financial Summary & Overdue Semantics (GET /api/loans/summary
       overdueAmount: 0,
       outstandingAmount: 0,
     });
+  });
+
+  it("reflects customOverdueAmount in summary when set on an overdue loan", async () => {
+    vi.spyOn(prisma.loan as any, "aggregate").mockImplementation(async ({ where }: any) => {
+      if (where.status === "REPAID") {
+        return { _sum: { amount: new Prisma.Decimal("0") } } as any;
+      }
+      return { _sum: { amount: new Prisma.Decimal("1000.00") } } as any;
+    });
+
+    vi.spyOn(prisma.loan as any, "findMany").mockResolvedValueOnce([
+      // Loan amount is 1000.00, but custom overdue amount is set to 1250.00 (e.g. penalty or negotiated)
+      { amount: new Prisma.Decimal("1000.00"), customOverdueAmount: new Prisma.Decimal("1250.00") },
+    ]);
+
+    const response = await request(app)
+      .get("/api/loans/summary")
+      .set("Authorization", `Bearer ${userToken}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.overdueAmount).toBe(1250);
   });
 
   it("ensures loans due today are NOT classified as overdue", () => {
@@ -669,6 +697,19 @@ describe("Phase 4: Financial Summary & Overdue Semantics (GET /api/loans/summary
     expect(summary.overdueAmount).toBe(500);
     expect(summary.totalRepaid).toBe(2000);
     expect(summary.outstandingAmount).toBe(500);
+  });
+
+  it("calculates customOverdueAmount in pure calculation function", () => {
+    const referenceDate = new Date("2026-10-23T00:00:00.000Z");
+
+    const loans = [
+      { amount: 1000, status: "PENDING" as const, dueDate: "2026-10-20", customOverdueAmount: 1150 }, // overdue with custom amount
+      { amount: 500, status: "PENDING" as const, dueDate: "2026-10-20" }, // overdue with default amount
+    ];
+
+    const summary = calculateLoanSummary(loans, referenceDate);
+    expect(summary.totalLent).toBe(1500);
+    expect(summary.overdueAmount).toBe(1650); // 1150 + 500
   });
 });
 
@@ -741,3 +782,329 @@ describe("Financial Business Logic & Calculations (Pure Unit Tests)", () => {
     expect(isLoanOverdue({ status: "REPAID", dueDate: "2026-10-10" }, refDate)).toBe(false);
   });
 });
+
+describe("Phase 7: Receipt Photo Upload, Security & Isolation", () => {
+  const aliceId = "user-alice";
+  const bobId = "user-bob";
+  const aliceToken = signToken(aliceId);
+  const bobToken = signToken(bobId);
+
+  const sampleJpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]);
+
+  beforeEach(() => {
+    vi.spyOn(prisma.user as any, "findUnique").mockImplementation(async ({ where }: any) => {
+      return { id: where.id, phone: "9876543210" } as any;
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("rejects receipt upload with unsupported MIME types", async () => {
+    const res = await request(app)
+      .post("/api/loans/loan-1/receipt")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({
+        imageBase64: Buffer.from("dummy").toString("base64"),
+        contentType: "application/pdf",
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("Only JPEG, PNG, and WebP images are allowed");
+  });
+
+  it("rejects receipt upload with mismatched or corrupted magic bytes", async () => {
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce({
+      id: "loan-1",
+      userId: aliceId,
+    } as any);
+
+    const fakeJpeg = Buffer.from("This is plain text pretending to be jpeg");
+    const res = await request(app)
+      .post("/api/loans/loan-1/receipt")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({
+        imageBase64: fakeJpeg.toString("base64"),
+        contentType: "image/jpeg",
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("Invalid file content");
+  });
+
+  it("strictly prevents cross-user receipt attachment (User B cannot attach to User A's loan -> 404)", async () => {
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .post("/api/loans/alice-loan-id/receipt")
+      .set("Authorization", `Bearer ${bobToken}`)
+      .send({
+        imageBase64: sampleJpeg.toString("base64"),
+        contentType: "image/jpeg",
+      });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Loan not found");
+  });
+
+  it("strictly prevents cross-user receipt access (User B cannot view User A's receipt -> 404)", async () => {
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .get("/api/loans/alice-loan-id/receipt")
+      .set("Authorization", `Bearer ${bobToken}`);
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Loan not found");
+  });
+
+  it("rejects unauthenticated receipt upload and access with 401", async () => {
+    const postRes = await request(app)
+      .post("/api/loans/some-id/receipt")
+      .send({ imageBase64: sampleJpeg.toString("base64"), contentType: "image/jpeg" });
+    expect(postRes.status).toBe(401);
+
+    const getRes = await request(app).get("/api/loans/some-id/receipt");
+    expect(getRes.status).toBe(401);
+  });
+
+  it("successfully attaches a receipt photo to an existing loan", async () => {
+    const existingLoan = {
+      id: "loan-99",
+      userId: aliceId,
+      friendName: "Rahul",
+      amount: new Prisma.Decimal("500.00"),
+      dueDate: new Date("2026-11-20T00:00:00.000Z"),
+      status: "PENDING",
+      createdAt: new Date("2026-10-23T10:00:00.000Z"),
+      repaidAt: null,
+      receiptPath: null,
+      receiptContentType: null,
+    };
+
+    const updatedLoan = {
+      ...existingLoan,
+      receiptPath: `receipts/${aliceId}/loan-99.jpg`,
+      receiptContentType: "image/jpeg",
+    };
+
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(existingLoan as any);
+    const updateSpy = vi.spyOn(prisma.loan as any, "update").mockResolvedValueOnce(updatedLoan as any);
+
+    const res = await request(app)
+      .post("/api/loans/loan-99/receipt")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({
+        imageBase64: sampleJpeg.toString("base64"),
+        contentType: "image/jpeg",
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.hasReceipt).toBe(true);
+    expect(res.body.receiptUrl).toBe("/api/loans/loan-99/receipt");
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "loan-99" },
+      data: {
+        receiptPath: expect.stringContaining("receipts"),
+        receiptContentType: "image/jpeg",
+      },
+    });
+  });
+
+  it("successfully serves receipt image to the owner", async () => {
+    // save real file to local disk for test
+    const { receiptStorage } = await import("./storage.js");
+    await receiptStorage.save(aliceId, "loan-serve-test", sampleJpeg, "image/jpeg");
+
+    const loanWithReceipt = {
+      id: "loan-serve-test",
+      userId: aliceId,
+      friendName: "Rahul",
+      receiptPath: `receipts/${aliceId}/loan-serve-test.jpg`,
+      receiptContentType: "image/jpeg",
+    };
+
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(loanWithReceipt as any);
+
+    const res = await request(app)
+      .get("/api/loans/loan-serve-test/receipt")
+      .set("Authorization", `Bearer ${aliceToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toBe("image/jpeg");
+    expect(res.headers["cache-control"]).toContain("private");
+    expect(res.body).toEqual(sampleJpeg);
+  });
+
+  it("supports ?format=json to return data URL", async () => {
+    const { receiptStorage } = await import("./storage.js");
+    await receiptStorage.save(aliceId, "loan-json-test", sampleJpeg, "image/jpeg");
+
+    const loanWithReceipt = {
+      id: "loan-json-test",
+      userId: aliceId,
+      friendName: "Rahul",
+      receiptPath: `receipts/${aliceId}/loan-json-test.jpg`,
+      receiptContentType: "image/jpeg",
+    };
+
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(loanWithReceipt as any);
+
+    const res = await request(app)
+      .get("/api/loans/loan-json-test/receipt?format=json")
+      .set("Authorization", `Bearer ${aliceToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.url).toContain("data:image/jpeg;base64,");
+    expect(res.body.contentType).toBe("image/jpeg");
+  });
+
+  it("successfully deletes receipt from loan", async () => {
+    const loanWithReceipt = {
+      id: "loan-99",
+      userId: aliceId,
+      friendName: "Rahul",
+      amount: new Prisma.Decimal("500.00"),
+      dueDate: new Date("2026-11-20T00:00:00.000Z"),
+      status: "PENDING",
+      createdAt: new Date("2026-10-23T10:00:00.000Z"),
+      repaidAt: null,
+      receiptPath: `receipts/${aliceId}/loan-99.jpg`,
+      receiptContentType: "image/jpeg",
+    };
+
+    const loanWithoutReceipt = {
+      ...loanWithReceipt,
+      receiptPath: null,
+      receiptContentType: null,
+    };
+
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(loanWithReceipt as any);
+    const updateSpy = vi.spyOn(prisma.loan as any, "update").mockResolvedValueOnce(loanWithoutReceipt as any);
+
+    const res = await request(app)
+      .delete("/api/loans/loan-99/receipt")
+      .set("Authorization", `Bearer ${aliceToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.hasReceipt).toBe(false);
+    expect(res.body.receiptUrl).toBeNull();
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "loan-99" },
+      data: { receiptPath: null, receiptContentType: null },
+    });
+  });
+});
+
+describe("Custom Overdue Amount (PATCH /api/loans/:id/overdue)", () => {
+  const aliceId = "user-alice";
+  const bobId = "user-bob";
+  const aliceToken = signToken(aliceId);
+  const bobToken = signToken(bobId);
+
+  beforeEach(() => {
+    vi.spyOn(prisma.user as any, "findUnique").mockImplementation(async ({ where }: any) => {
+      return { id: where.id, phone: "9876543210" } as any;
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("updates custom overdue amount on an existing loan", async () => {
+    const existingLoan = {
+      id: "loan-custom-1",
+      userId: aliceId,
+      friendName: "Vikram",
+      amount: new Prisma.Decimal("1000.00"),
+      dueDate: new Date("2026-10-20T00:00:00.000Z"),
+      status: "PENDING",
+      customOverdueAmount: null,
+      createdAt: new Date(),
+      repaidAt: null,
+    };
+
+    const updatedLoan = {
+      ...existingLoan,
+      customOverdueAmount: new Prisma.Decimal("1200.00"),
+    };
+
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(existingLoan as any);
+    const updateSpy = vi.spyOn(prisma.loan as any, "update").mockResolvedValueOnce(updatedLoan as any);
+
+    const res = await request(app)
+      .patch("/api/loans/loan-custom-1/overdue")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({ customOverdueAmount: 1200 });
+
+    expect(res.status).toBe(200);
+    expect(res.body.customOverdueAmount).toBe("1200.00");
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "loan-custom-1" },
+      data: { customOverdueAmount: "1200.00" },
+    });
+  });
+
+  it("allows clearing custom overdue amount by passing null", async () => {
+    const existingLoan = {
+      id: "loan-custom-1",
+      userId: aliceId,
+      friendName: "Vikram",
+      amount: new Prisma.Decimal("1000.00"),
+      dueDate: new Date("2026-10-20T00:00:00.000Z"),
+      status: "PENDING",
+      customOverdueAmount: new Prisma.Decimal("1200.00"),
+      createdAt: new Date(),
+      repaidAt: null,
+    };
+
+    const clearedLoan = {
+      ...existingLoan,
+      customOverdueAmount: null,
+    };
+
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(existingLoan as any);
+    const updateSpy = vi.spyOn(prisma.loan as any, "update").mockResolvedValueOnce(clearedLoan as any);
+
+    const res = await request(app)
+      .patch("/api/loans/loan-custom-1/overdue")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({ customOverdueAmount: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.customOverdueAmount).toBeNull();
+    expect(updateSpy).toHaveBeenCalledWith({
+      where: { id: "loan-custom-1" },
+      data: { customOverdueAmount: null },
+    });
+  });
+
+  it("prevents Bob from modifying Alice's overdue amount (404 Loan not found)", async () => {
+    vi.spyOn(prisma.loan as any, "findFirst").mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .patch("/api/loans/alice-loan-id/overdue")
+      .set("Authorization", `Bearer ${bobToken}`)
+      .send({ customOverdueAmount: 500 });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("Loan not found");
+  });
+
+  it("rejects negative overdue amounts or more than 2 decimal places with 400", async () => {
+    const resNegative = await request(app)
+      .patch("/api/loans/loan-custom-1/overdue")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({ customOverdueAmount: -50 });
+    expect(resNegative.status).toBe(400);
+
+    const resDecimals = await request(app)
+      .patch("/api/loans/loan-custom-1/overdue")
+      .set("Authorization", `Bearer ${aliceToken}`)
+      .send({ customOverdueAmount: 50.123 });
+    expect(resDecimals.status).toBe(400);
+  });
+});
+

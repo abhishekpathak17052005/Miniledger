@@ -3,6 +3,7 @@ export interface LoanItem {
   amount: number | string;
   status: "PENDING" | "REPAID";
   dueDate: string | Date;
+  customOverdueAmount?: number | string | null;
 }
 
 export interface FinancialSummary {
@@ -41,7 +42,10 @@ export function calculateLoanSummary(
         : new Date(Date.UTC(loan.dueDate.getUTCFullYear(), loan.dueDate.getUTCMonth(), loan.dueDate.getUTCDate())).getTime();
 
       if (dueTime < startOfRefUTC) {
-        overdueAmount += amount;
+        const custom = loan.customOverdueAmount !== undefined && loan.customOverdueAmount !== null
+          ? Number(loan.customOverdueAmount)
+          : NaN;
+        overdueAmount += Number.isFinite(custom) && custom >= 0 ? custom : amount;
       }
     }
   }
