@@ -3,11 +3,12 @@ import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Image,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   RefreshControl,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
@@ -15,7 +16,9 @@ import {
   View,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
+import * as ImagePicker from "expo-image-picker";
 
 const getDefaultApiUrl = (): string => {
   if (process.env.EXPO_PUBLIC_API_URL) {
@@ -37,6 +40,9 @@ type Loan = {
   amount: string;
   dueDate: string;
   status: "PENDING" | "REPAID";
+  customOverdueAmount?: string | null;
+  hasReceipt?: boolean;
+  receiptUrl?: string | null;
   createdAt?: string;
   repaidAt?: string | null;
 };
@@ -49,6 +55,14 @@ type Summary = {
 };
 
 type FilterType = "ALL" | "PENDING" | "OVERDUE" | "REPAID";
+
+type SelectedReceipt = {
+  uri: string;
+  base64: string;
+  contentType: "image/jpeg" | "image/png" | "image/webp";
+  fileSize?: number;
+  fileName?: string;
+};
 
 interface ApiError extends Error {
   status?: number;
@@ -105,7 +119,15 @@ const addDaysToDate = (days: number): string => {
 const normalizePhone = (raw: string): string =>
   raw.trim().replace(/[\s-]/g, "").replace(/^(\+91|0)/, "");
 
-export default function App() {
+const formatFileSize = (bytes?: number): string => {
+  if (!bytes) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+};
+
+function AppContent() {
+  const insets = useSafeAreaInsets();
   const [token, setToken] = useState<string | null>(null);
   const [userPhone, setUserPhone] = useState<string>("");
   const [phone, setPhone] = useState("");
@@ -125,7 +147,19 @@ export default function App() {
   const [friendName, setFriendName] = useState("");
   const [amount, setAmount] = useState("");
   const [dueDate, setDueDate] = useState(addDaysToDate(7));
+  const [customOverdueInput, setCustomOverdueInput] = useState("");
+  const [selectedReceipt, setSelectedReceipt] = useState<SelectedReceipt | null>(null);
   const [showForm, setShowForm] = useState(false);
+
+  // Overdue amount modal states
+  const [editingOverdueLoan, setEditingOverdueLoan] = useState<Loan | null>(null);
+  const [overdueAmountInput, setOverdueAmountInput] = useState("");
+  const [overdueModalError, setOverdueModalError] = useState("");
+
+  // Receipt viewer modal states
+  const [viewingReceiptLoan, setViewingReceiptLoan] = useState<Loan | null>(null);
+  const [viewingReceiptUrl, setViewingReceiptUrl] = useState<string | null>(null);
+  const [loadingReceiptImage, setLoadingReceiptImage] = useState(false);
 
   // Filter & Search states
   const [searchQuery, setSearchQuery] = useState("");
@@ -269,6 +303,61 @@ export default function App() {
     }
   }
 
+  async function pickReceiptImage() {
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert(
+          "Permission Required",
+          "Permission to access photo gallery is needed to attach a receipt."
+        );
+        return;
+      }
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images"],
+        allowsEditing: false,
+        quality: 0.8,
+        base64: true,
+      });
+
+      if (result.canceled || !result.assets || result.assets.length === 0) {
+        return;
+      }
+
+      const asset = result.assets[0];
+      if (!asset.base64) {
+        setError("Could not read image content. Please try another photo.");
+        return;
+      }
+
+      // Check size limit: 5MB
+      const approxBytes = Math.round((asset.base64.length * 3) / 4);
+      if (approxBytes > 5 * 1024 * 1024) {
+        setError("Receipt image exceeds maximum size of 5MB.");
+        return;
+      }
+
+      let mime: "image/jpeg" | "image/png" | "image/webp" = "image/jpeg";
+      if (asset.mimeType === "image/png" || asset.uri.toLowerCase().endsWith(".png")) {
+        mime = "image/png";
+      } else if (asset.mimeType === "image/webp" || asset.uri.toLowerCase().endsWith(".webp")) {
+        mime = "image/webp";
+      }
+
+      setSelectedReceipt({
+        uri: asset.uri,
+        base64: asset.base64,
+        contentType: mime,
+        fileSize: asset.fileSize || approxBytes,
+        fileName: asset.fileName || "receipt_attachment",
+      });
+      setError("");
+    } catch {
+      setError("Failed to open image picker. Please try again.");
+    }
+  }
+
   async function addLoan() {
     const trimmedName = friendName.trim();
     const numericAmount = Number(amount);
@@ -295,6 +384,12 @@ export default function App() {
       return;
     }
 
+    const customOverdueNum = customOverdueInput.trim() ? Number(customOverdueInput.trim()) : undefined;
+    if (customOverdueNum !== undefined && (!Number.isFinite(customOverdueNum) || customOverdueNum < 0)) {
+      setError("Custom overdue amount must be a valid positive number.");
+      return;
+    }
+
     setBusy(true);
     setError("");
     try {
@@ -304,11 +399,20 @@ export default function App() {
           friendName: trimmedName,
           amount: numericAmount,
           dueDate,
+          customOverdueAmount: customOverdueNum,
+          receipt: selectedReceipt
+            ? {
+                imageBase64: selectedReceipt.base64,
+                contentType: selectedReceipt.contentType,
+              }
+            : undefined,
         }),
       });
       setFriendName("");
       setAmount("");
       setDueDate(addDaysToDate(7));
+      setCustomOverdueInput("");
+      setSelectedReceipt(null);
       setShowForm(false);
       setSuccessMessage(`Loan of ${rupees(numericAmount)} to ${trimmedName} recorded!`);
       await refresh();
@@ -317,6 +421,135 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  function openSetOverdueModal(loan: Loan) {
+    setEditingOverdueLoan(loan);
+    setOverdueAmountInput(loan.customOverdueAmount ? loan.customOverdueAmount : "");
+    setOverdueModalError("");
+  }
+
+  async function saveCustomOverdueAmount(amountVal: string | null) {
+    if (!editingOverdueLoan) return;
+    setOverdueModalError("");
+
+    let payloadVal: number | null = null;
+    if (amountVal !== null && amountVal.trim() !== "") {
+      const num = Number(amountVal.trim());
+      if (!Number.isFinite(num) || num < 0) {
+        setOverdueModalError("Please enter a valid positive amount.");
+        return;
+      }
+      const decimalParts = amountVal.includes(".") ? amountVal.split(".")[1] : "";
+      if (decimalParts.length > 2) {
+        setOverdueModalError("Amount cannot have more than 2 decimal places.");
+        return;
+      }
+      payloadVal = num;
+    }
+
+    setBusy(true);
+    try {
+      await api(`/api/loans/${editingOverdueLoan.id}/overdue`, token!, {
+        method: "PATCH",
+        body: JSON.stringify({ customOverdueAmount: payloadVal }),
+      });
+      setSuccessMessage(
+        payloadVal !== null
+          ? `Overdue amount for ${editingOverdueLoan.friendName} updated to ₹${payloadVal.toFixed(2)}`
+          : `Overdue amount for ${editingOverdueLoan.friendName} reset to original loan amount.`
+      );
+      setEditingOverdueLoan(null);
+      await refresh();
+    } catch (err: any) {
+      setOverdueModalError(err?.message || "Failed to update overdue amount.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openReceiptViewer(loan: Loan) {
+    setViewingReceiptLoan(loan);
+    setLoadingReceiptImage(true);
+    setViewingReceiptUrl(null);
+    try {
+      const data = await api<{ url: string; contentType?: string }>(
+        `/api/loans/${loan.id}/receipt?format=json`,
+        token!
+      );
+      setViewingReceiptUrl(data.url);
+    } catch (err: any) {
+      Alert.alert("Receipt Error", err?.message || "Could not load receipt photo.");
+      setViewingReceiptLoan(null);
+    } finally {
+      setLoadingReceiptImage(false);
+    }
+  }
+
+  async function attachReceiptToExistingLoan(loan: Loan) {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images"],
+        allowsEditing: false,
+        quality: 0.8,
+        base64: true,
+      });
+
+      if (result.canceled || !result.assets || result.assets.length === 0) return;
+      const asset = result.assets[0];
+      if (!asset.base64) return;
+
+      const approxBytes = Math.round((asset.base64.length * 3) / 4);
+      if (approxBytes > 5 * 1024 * 1024) {
+        Alert.alert("File Too Large", "Receipt image must be smaller than 5MB.");
+        return;
+      }
+
+      let mime: "image/jpeg" | "image/png" | "image/webp" = "image/jpeg";
+      if (asset.mimeType === "image/png" || asset.uri.toLowerCase().endsWith(".png")) {
+        mime = "image/png";
+      } else if (asset.mimeType === "image/webp" || asset.uri.toLowerCase().endsWith(".webp")) {
+        mime = "image/webp";
+      }
+
+      setBusy(true);
+      await api(`/api/loans/${loan.id}/receipt`, token!, {
+        method: "POST",
+        body: JSON.stringify({
+          imageBase64: asset.base64,
+          contentType: mime,
+        }),
+      });
+      setSuccessMessage(`Receipt attached to loan for ${loan.friendName}!`);
+      await refresh();
+    } catch (err: any) {
+      setError(err?.message || "Failed to attach receipt.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteReceiptFromLoan(loan: Loan) {
+    Alert.alert("Delete Receipt", "Are you sure you want to remove this receipt photo?", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Delete",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            setBusy(true);
+            await api(`/api/loans/${loan.id}/receipt`, token!, { method: "DELETE" });
+            setViewingReceiptLoan(null);
+            setSuccessMessage("Receipt removed successfully.");
+            await refresh();
+          } catch (err: any) {
+            setError(err?.message || "Could not delete receipt.");
+          } finally {
+            setBusy(false);
+          }
+        },
+      },
+    ]);
   }
 
   function confirmRepayment(loan: Loan) {
@@ -413,10 +646,13 @@ export default function App() {
   // Login View
   if (!token) {
     return (
-      <SafeAreaView style={styles.safe}>
+      <View style={styles.safe}>
         <StatusBar style="dark" />
         <KeyboardAvoidingView
-          style={styles.loginWrap}
+          style={[
+            styles.loginWrap,
+            { paddingTop: insets.top + 22, paddingBottom: insets.bottom + 22 },
+          ]}
           behavior={Platform.OS === "ios" ? "padding" : undefined}
         >
           <View style={styles.logo}>
@@ -518,15 +754,15 @@ export default function App() {
             </Text>
           </View>
         </KeyboardAvoidingView>
-      </SafeAreaView>
+      </View>
     );
   }
 
   // Authenticated Dashboard View
   return (
-    <SafeAreaView style={styles.safe}>
+    <View style={styles.safe}>
       <StatusBar style="dark" />
-      <View style={styles.topbar}>
+      <View style={[styles.topbar, { paddingTop: insets.top + 12 }]}>
         <View>
           <Text style={styles.brandSmall}>MiniLedger</Text>
           <Text style={styles.subtitleSmall}>
@@ -539,7 +775,7 @@ export default function App() {
       </View>
 
       <ScrollView
-        contentContainerStyle={styles.content}
+        contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + 32 }]}
         keyboardShouldPersistTaps="handled"
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} tintColor="#2457E6" />
@@ -649,6 +885,48 @@ export default function App() {
                 <Text style={styles.presetText}>+30 Days</Text>
               </Pressable>
             </View>
+
+            {/* Receipt Photo Attachment */}
+            <Text style={styles.label}>RECEIPT PHOTO (OPTIONAL)</Text>
+            {selectedReceipt ? (
+              <View style={styles.receiptPreviewContainer}>
+                <Image source={{ uri: selectedReceipt.uri }} style={styles.receiptThumbnail} />
+                <View style={styles.receiptDetails}>
+                  <Text style={styles.receiptFileName} numberOfLines={1}>
+                    {selectedReceipt.fileName}
+                  </Text>
+                  <Text style={styles.receiptFileSize}>
+                    {formatFileSize(selectedReceipt.fileSize)} ({selectedReceipt.contentType.replace("image/", "").toUpperCase()})
+                  </Text>
+                </View>
+                <Pressable
+                  style={styles.removeReceiptButton}
+                  onPress={() => setSelectedReceipt(null)}
+                >
+                  <Text style={styles.removeReceiptText}>✕ Remove</Text>
+                </Pressable>
+              </View>
+            ) : (
+              <Pressable
+                style={styles.attachReceiptButton}
+                onPress={() => void pickReceiptImage()}
+              >
+                <Text style={styles.attachReceiptText}>📷 Choose Receipt Photo (Gallery / File)</Text>
+              </Pressable>
+            )}
+
+            <Text style={styles.label}>CUSTOM OVERDUE AMOUNT (OPTIONAL)</Text>
+            <TextInput
+              style={styles.input}
+              value={customOverdueInput}
+              onChangeText={(t) => {
+                setCustomOverdueInput(t);
+                if (error) setError("");
+              }}
+              placeholder="Leave blank to default to original loan amount"
+              placeholderTextColor="#A0AEC0"
+              keyboardType="decimal-pad"
+            />
 
             {!!error && <Text style={styles.error}>{error}</Text>}
 
@@ -782,10 +1060,25 @@ export default function App() {
                     </View>
 
                     <View style={styles.loanNameWrap}>
-                      <Text style={styles.loanName}>{item.friendName}</Text>
+                      <View style={styles.nameRow}>
+                        <Text style={styles.loanName}>{item.friendName}</Text>
+                        {item.hasReceipt && (
+                          <Pressable
+                            style={styles.receiptPill}
+                            onPress={() => void openReceiptViewer(item)}
+                          >
+                            <Text style={styles.receiptPillText}>📷 Receipt</Text>
+                          </Pressable>
+                        )}
+                      </View>
                       <Text style={styles.loanDue}>
                         {isOverdue ? `⚠️ Overdue since ${item.dueDate}` : `Due: ${item.dueDate}`}
                       </Text>
+                      {isOverdue && item.customOverdueAmount && (
+                        <Text style={styles.customOverdueText}>
+                          Overdue: {rupees(item.customOverdueAmount)} (Custom)
+                        </Text>
+                      )}
                     </View>
 
                     <Text
@@ -822,22 +1115,44 @@ export default function App() {
                       </Text>
                     </View>
 
-                    {item.status === "PENDING" && (
-                      <Pressable
-                        style={[
-                          styles.repayButton,
-                          (busy || repayingId !== null) && styles.buttonDisabled,
-                        ]}
-                        disabled={busy || repayingId !== null}
-                        onPress={() => confirmRepayment(item)}
-                      >
-                        {isItemRepaying ? (
-                          <ActivityIndicator size="small" color="#175CD3" />
-                        ) : (
-                          <Text style={styles.repayButtonText}>Mark Repaid</Text>
-                        )}
-                      </Pressable>
-                    )}
+                    <View style={styles.loanActionsRow}>
+                      {isOverdue && item.status === "PENDING" && (
+                        <Pressable
+                          style={styles.setOverdueBtn}
+                          onPress={() => openSetOverdueModal(item)}
+                        >
+                          <Text style={styles.setOverdueBtnText}>
+                            {item.customOverdueAmount ? "✏️ Overdue" : "+ Overdue"}
+                          </Text>
+                        </Pressable>
+                      )}
+
+                      {!item.hasReceipt && item.status === "PENDING" && (
+                        <Pressable
+                          style={styles.addReceiptBtn}
+                          onPress={() => void attachReceiptToExistingLoan(item)}
+                        >
+                          <Text style={styles.addReceiptBtnText}>+ Receipt</Text>
+                        </Pressable>
+                      )}
+
+                      {item.status === "PENDING" && (
+                        <Pressable
+                          style={[
+                            styles.repayButton,
+                            (busy || repayingId !== null) && styles.buttonDisabled,
+                          ]}
+                          disabled={busy || repayingId !== null}
+                          onPress={() => confirmRepayment(item)}
+                        >
+                          {isItemRepaying ? (
+                            <ActivityIndicator size="small" color="#175CD3" />
+                          ) : (
+                            <Text style={styles.repayButtonText}>Mark Repaid</Text>
+                          )}
+                        </Pressable>
+                      )}
+                    </View>
                   </View>
                 </View>
               );
@@ -849,13 +1164,147 @@ export default function App() {
           <Text style={styles.refreshText}>↻ Tap to refresh summary</Text>
         </Pressable>
       </ScrollView>
-    </SafeAreaView>
+
+      {/* Receipt Viewer Modal */}
+      <Modal
+        visible={viewingReceiptLoan !== null}
+        animationType="slide"
+        transparent
+        onRequestClose={() => setViewingReceiptLoan(null)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitle}>Receipt Attachment</Text>
+                <Text style={styles.modalSubtitle}>
+                  Loan for {viewingReceiptLoan?.friendName} ({rupees(viewingReceiptLoan?.amount || 0)})
+                </Text>
+              </View>
+              <Pressable
+                style={styles.modalCloseButton}
+                onPress={() => setViewingReceiptLoan(null)}
+              >
+                <Text style={styles.modalCloseText}>✕</Text>
+              </Pressable>
+            </View>
+
+            <View style={styles.modalImageContainer}>
+              {loadingReceiptImage ? (
+                <View style={styles.modalLoadingBox}>
+                  <ActivityIndicator size="large" color="#1F4FD6" />
+                  <Text style={styles.modalLoadingText}>Loading receipt...</Text>
+                </View>
+              ) : viewingReceiptUrl ? (
+                <Image
+                  source={{ uri: viewingReceiptUrl }}
+                  style={styles.modalReceiptImage}
+                  resizeMode="contain"
+                />
+              ) : (
+                <Text style={styles.modalErrorText}>Receipt image not available.</Text>
+              )}
+            </View>
+
+            <View style={styles.modalFooter}>
+              {viewingReceiptLoan && (
+                <Pressable
+                  style={styles.modalDeleteButton}
+                  onPress={() => void deleteReceiptFromLoan(viewingReceiptLoan)}
+                >
+                  <Text style={styles.modalDeleteText}>🗑 Remove Receipt</Text>
+                </Pressable>
+              )}
+              <Pressable
+                style={styles.modalDoneButton}
+                onPress={() => setViewingReceiptLoan(null)}
+              >
+                <Text style={styles.modalDoneText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Overdue Amount Modal */}
+      <Modal
+        visible={editingOverdueLoan !== null}
+        animationType="fade"
+        transparent
+        onRequestClose={() => setEditingOverdueLoan(null)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { maxHeight: 420 }]}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitle}>Set Overdue Amount</Text>
+                <Text style={styles.modalSubtitle}>
+                  {editingOverdueLoan?.friendName} · Original: {rupees(editingOverdueLoan?.amount || 0)}
+                </Text>
+              </View>
+              <Pressable
+                style={styles.modalCloseButton}
+                onPress={() => setEditingOverdueLoan(null)}
+              >
+                <Text style={styles.modalCloseText}>✕</Text>
+              </Pressable>
+            </View>
+
+            <View style={{ padding: 20 }}>
+              <Text style={styles.overdueModalHint}>
+                Specify a customized overdue amount (e.g. adding a late fee, penalty, or negotiated reduction). Leaving blank or resetting uses the original loan amount.
+              </Text>
+
+              <Text style={styles.label}>CUSTOM OVERDUE AMOUNT (₹)</Text>
+              <TextInput
+                style={styles.input}
+                value={overdueAmountInput}
+                onChangeText={(t) => {
+                  setOverdueAmountInput(t);
+                  if (overdueModalError) setOverdueModalError("");
+                }}
+                placeholder={`Original amount: ${editingOverdueLoan?.amount || 0}`}
+                placeholderTextColor="#A0AEC0"
+                keyboardType="decimal-pad"
+              />
+
+              {!!overdueModalError && (
+                <Text style={[styles.error, { marginTop: 4 }]}>{overdueModalError}</Text>
+              )}
+            </View>
+
+            <View style={styles.modalFooter}>
+              <Pressable
+                style={styles.modalDeleteButton}
+                onPress={() => void saveCustomOverdueAmount(null)}
+              >
+                <Text style={styles.modalDeleteText}>↺ Reset to Original</Text>
+              </Pressable>
+              <Pressable
+                style={styles.modalDoneButton}
+                onPress={() => void saveCustomOverdueAmount(overdueAmountInput)}
+              >
+                <Text style={styles.modalDoneText}>Save</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+export default function App() {
+  return (
+    <SafeAreaProvider>
+      <AppContent />
+    </SafeAreaProvider>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: "#F7F9FC" },
-  loginWrap: { flex: 1, justifyContent: "center", padding: 22 },
+  loginWrap: { flex: 1, justifyContent: "center", paddingHorizontal: 22 },
   logo: {
     width: 60,
     height: 60,
@@ -972,7 +1421,6 @@ const styles = StyleSheet.create({
   demoNoteBody: { color: "#1849A9", fontSize: 12 },
   topbar: {
     paddingHorizontal: 20,
-    paddingTop: 12,
     paddingBottom: 14,
     flexDirection: "row",
     alignItems: "center",
@@ -987,7 +1435,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   logoutText: { color: "#344054", fontWeight: "700", fontSize: 12 },
-  content: { paddingHorizontal: 18, paddingBottom: 32 },
+  content: { paddingHorizontal: 18, paddingTop: 6 },
   sectionTitle: { fontSize: 18, fontWeight: "800", color: "#101828" },
   hero: {
     backgroundColor: "#163AB0",
@@ -1064,6 +1512,48 @@ const styles = StyleSheet.create({
     marginVertical: 2,
   },
   presetText: { fontSize: 11, color: "#344054", fontWeight: "700" },
+
+  // Receipt Photo Styles in Form
+  attachReceiptButton: {
+    backgroundColor: "#F8F9FC",
+    borderWidth: 1,
+    borderColor: "#D0D5DD",
+    borderStyle: "dashed",
+    borderRadius: 12,
+    paddingVertical: 12,
+    alignItems: "center",
+    marginTop: 4,
+    marginBottom: 8,
+  },
+  attachReceiptText: { color: "#1F4FD6", fontSize: 13, fontWeight: "700" },
+  receiptPreviewContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#EFF8FF",
+    borderWidth: 1,
+    borderColor: "#B2DDFF",
+    borderRadius: 12,
+    padding: 8,
+    marginTop: 4,
+    marginBottom: 8,
+  },
+  receiptThumbnail: {
+    width: 48,
+    height: 48,
+    borderRadius: 8,
+    backgroundColor: "#EAECF0",
+  },
+  receiptDetails: { flex: 1, marginLeft: 10 },
+  receiptFileName: { fontSize: 13, fontWeight: "700", color: "#101828" },
+  receiptFileSize: { fontSize: 11, color: "#667085", marginTop: 2 },
+  removeReceiptButton: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 6,
+    backgroundColor: "#FEE4E2",
+  },
+  removeReceiptText: { color: "#B42318", fontSize: 12, fontWeight: "700" },
+
   searchWrap: { marginBottom: 12 },
   searchInput: {
     backgroundColor: "white",
@@ -1126,7 +1616,17 @@ const styles = StyleSheet.create({
   avatarTextOverdue: { color: "#D92D20" },
   avatarTextRepaid: { color: "#079455" },
   loanNameWrap: { flex: 1, marginLeft: 12 },
-  loanName: { fontSize: 16, color: "#101828", fontWeight: "800" },
+  nameRow: { flexDirection: "row", alignItems: "center", flexWrap: "wrap" },
+  loanName: { fontSize: 16, color: "#101828", fontWeight: "800", marginRight: 6 },
+  receiptPill: {
+    backgroundColor: "#EFF8FF",
+    borderColor: "#B2DDFF",
+    borderWidth: 1,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+  },
+  receiptPillText: { fontSize: 10, color: "#175CD3", fontWeight: "800" },
   loanDue: { fontSize: 12, color: "#667085", marginTop: 3 },
   loanAmount: { color: "#101828", fontWeight: "900", fontSize: 16 },
   loanAmountOverdue: { color: "#D92D20" },
@@ -1151,6 +1651,15 @@ const styles = StyleSheet.create({
   statusText: { color: "#B54708", fontSize: 11, fontWeight: "800" },
   statusTextOverdue: { color: "#D92D20" },
   statusTextRepaid: { color: "#079455" },
+  loanActionsRow: { flexDirection: "row", alignItems: "center" },
+  addReceiptBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+    backgroundColor: "#F2F4F7",
+    marginRight: 6,
+  },
+  addReceiptBtnText: { color: "#344054", fontWeight: "700", fontSize: 11 },
   repayButton: {
     backgroundColor: "#EFF8FF",
     borderWidth: 1,
@@ -1175,4 +1684,89 @@ const styles = StyleSheet.create({
   emptySubtitle: { color: "#667085", fontSize: 13, textAlign: "center" },
   refresh: { padding: 14, alignItems: "center" },
   refreshText: { color: "#1F4FD6", fontWeight: "700", fontSize: 13 },
+
+  // Receipt Modal Styles
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.6)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 18,
+  },
+  modalCard: {
+    width: "100%",
+    maxWidth: 480,
+    backgroundColor: "white",
+    borderRadius: 20,
+    padding: 20,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.25,
+    shadowRadius: 14,
+    elevation: 8,
+  },
+  modalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    marginBottom: 14,
+  },
+  modalTitle: { fontSize: 18, fontWeight: "900", color: "#101828" },
+  modalSubtitle: { fontSize: 13, color: "#667085", marginTop: 2 },
+  modalCloseButton: {
+    padding: 6,
+    borderRadius: 8,
+    backgroundColor: "#F2F4F7",
+  },
+  modalCloseText: { fontSize: 16, fontWeight: "800", color: "#475467" },
+  modalImageContainer: {
+    width: "100%",
+    height: 320,
+    backgroundColor: "#F9FAFB",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#EAECF0",
+    overflow: "hidden",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  modalReceiptImage: { width: "100%", height: "100%" },
+  modalLoadingBox: { alignItems: "center" },
+  modalLoadingText: { marginTop: 10, fontSize: 13, color: "#667085", fontWeight: "600" },
+  modalErrorText: { fontSize: 13, color: "#D92D20", fontWeight: "600" },
+  modalFooter: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginTop: 16,
+  },
+  modalDeleteButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    backgroundColor: "#FEE4E2",
+  },
+  modalDeleteText: { color: "#B42318", fontSize: 12, fontWeight: "800" },
+  modalDoneButton: {
+    paddingHorizontal: 18,
+    paddingVertical: 8,
+    borderRadius: 8,
+    backgroundColor: "#1F4FD6",
+    marginLeft: "auto",
+  },
+  modalDoneText: { color: "white", fontSize: 13, fontWeight: "800" },
+
+  // Custom Overdue Amount Styles
+  setOverdueBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 8,
+    backgroundColor: "#FEF3F2",
+    borderColor: "#FECDCA",
+    borderWidth: 1,
+    marginRight: 6,
+  },
+  setOverdueBtnText: { color: "#B42318", fontWeight: "700", fontSize: 11 },
+  customOverdueText: { fontSize: 11, color: "#D92D20", fontWeight: "800", marginTop: 2 },
+  overdueModalHint: { fontSize: 13, color: "#475467", lineHeight: 18, marginBottom: 14 },
 });

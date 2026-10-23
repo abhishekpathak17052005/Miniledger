@@ -21,17 +21,20 @@ model User {
 }
 
 model Loan {
-  id         String      @id @default(cuid())
-  userId     String
-  friendName String      @db.VarChar(80)
-  amount     Decimal     @db.Decimal(12, 2)
-  dueDate    DateTime    @db.Date
-  status     LoanStatus  @default(PENDING)
-  createdAt  DateTime    @default(now())
-  updatedAt  DateTime    @default(now()) @updatedAt
-  repaidAt   DateTime?
-  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
-  repayments Repayment[]
+  id                 String      @id @default(cuid())
+  userId             String
+  friendName         String      @db.VarChar(80)
+  amount             Decimal     @db.Decimal(12, 2)
+  dueDate            DateTime    @db.Date
+  status             LoanStatus  @default(PENDING)
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @default(now()) @updatedAt
+  repaidAt           DateTime?
+  customOverdueAmount Decimal?   @db.Decimal(12, 2)
+  receiptPath        String?     @db.VarChar(255)
+  receiptContentType String?     @db.VarChar(50)
+  user               User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  repayments         Repayment[]
 
   @@index([userId, status, dueDate])
   @@index([userId, createdAt])
