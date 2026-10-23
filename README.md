@@ -1,24 +1,24 @@
 # MiniLedger 💳
 
-[![Backend Vitest](https://img.shields.io/badge/backend-56%20tests%20passing-brightgreen)](file:///c:/Users/Lenovo/Desktop/Projects/miniledger-starter/backend)
+[![Backend Vitest](https://img.shields.io/badge/backend-75%20tests%20passing-brightgreen)](file:///c:/Users/Lenovo/Desktop/Projects/miniledger-starter/backend)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8+-blue.svg)](file:///c:/Users/Lenovo/Desktop/Projects/miniledger-starter/backend)
 [![Expo](https://img.shields.io/badge/Expo-v53-black)](file:///c:/Users/Lenovo/Desktop/Projects/miniledger-starter/mobile)
 [![Prisma](https://img.shields.io/badge/Prisma-ORM%20v6-indigo)](file:///c:/Users/Lenovo/Desktop/Projects/miniledger-starter/backend/prisma)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Supabase-3ECF8E)](https://supabase.com)
 
-A functional full-stack personal finance demo application built to track money lent to friends, attach receipt photos, monitor repayments, and automatically flag overdue debts in real-time using mock OTP authentication.
+A functional full-stack personal finance application built to transform flat loan tracking into a friend-centric lending ledger. Manage reusable friend profiles, inspect detailed lending and repayment histories, record partial repayments, attach receipt photos, monitor debts, and flag overdue balances using mock OTP authentication.
 
 ---
 
 ## 📑 Table of Contents
 - [Key Features](#-key-features)
 - [System Architecture](#-system-architecture)
-- [Authentication & Loan Lifecycle](#-authentication--loan-lifecycle)
+- [Friend Profiles & Repayment Lifecycle](#-friend-profiles--repayment-lifecycle)
 - [Technology Stack](#-technology-stack)
-- [Database Schema & Prisma Configuration](#-database-schema--prisma-configuration)
+- [Database Schema & Migration Safety](#-database-schema--migration-safety)
 - [Environment Configuration](#-environment-configuration)
 - [Local Setup & Getting Started](#-local-setup--getting-started)
-- [Mock OTP & Receipt Demo Walkthrough](#-mock-otp--receipt-demo-walkthrough)
+- [Demo Walkthrough](#-demo-walkthrough)
 - [API Specification & Examples](#-api-specification--examples)
 - [Core Financial & Overdue Business Rules](#-core-financial--overdue-business-rules)
 - [Testing & Quality Verification](#-testing--quality-verification)
@@ -29,43 +29,55 @@ A functional full-stack personal finance demo application built to track money l
 
 ## ✨ Key Features
 
-1. **Passwordless Mock OTP Authentication**:
+1. **Friend Profiles & Duplicate Prevention Engine**:
+   - Reusable `Friend` entities owned by the authenticated user, linking all loans to a single profile.
+   - Whitespace and case-insensitive name matching (`normalizedName`) and digits-only phone normalization (`normalizedPhone`).
+   - Duplicate prevention: attempting to create an already-existing friend returns HTTP `409 Conflict` with matching profiles so the user can select an existing friend or resolve ambiguities without silent data corruption.
+   - Searchable friend selector in the Add Loan panel displaying current outstanding balances.
+
+2. **Dedicated Friend Profile Screen**:
+   - Comprehensive friend-level financial metrics: **Total Lent**, **Total Repaid**, **Outstanding Balance**, and **Overdue Amount**.
+   - Chronological unified timeline displaying all loans and partial repayments for that friend.
+   - Per-loan badges, due dates, receipt indicators, and overdue warnings.
+   - Direct "+ Lend More" quick action that pre-selects the friend.
+
+3. **Recorded Partial & Full Repayments**:
+   - First-class `Repayment` transactions: records amount received, repayment timestamp, loan ID, and optional note (e.g. "UPI installment").
+   - Atomic database `$transaction` ensuring repayments and loan status updates succeed or fail together.
+   - Partial repayments allowed with remaining balance recalculation; loans automatically transition to `REPAID` when balance reaches zero.
+   - Overpayment protection: strictly rejects repayments exceeding the remaining outstanding amount.
+   - Full backward compatibility: `PATCH /api/loans/:id/repay` continues to work seamlessly alongside `POST /api/loans/:id/repayments`.
+
+4. **Passwordless Mock OTP Authentication**:
    - Clean login via 10-digit Indian mobile numbers (`/^[6-9]\d{9}$/`).
    - Cryptographically secure 6-digit OTP generated via Node.js `crypto.randomInt()`.
    - 60-second resend cooldown with HTTP 429 rate limiting and live countdown timer in the UI.
    - 5-minute time-to-live (TTL) and 5-attempt limit per verification window.
    - Mock OTP printed directly to backend terminal console (never exposed in API responses).
 
-2. **Personal Lending Dashboard**:
-   - Real-time financial summary card: **Total Lent**, **Outstanding Amount**, **Total Repaid**, and **Overdue Amount**.
+5. **Personal Lending Dashboard**:
+   - Real-time global financial summary card: **Total Lent**, **Outstanding Amount**, **Total Repaid**, and **Overdue Amount**.
    - Currency display formatted with Indian Rupee symbol (`₹`) and two-decimal precision.
    - Dynamic search filter and category tabs (`All`, `Pending`, `Overdue`, `Repaid`) with live record counts.
 
-3. **Receipt Photo Attachment & Secure Private Storage**:
+6. **Receipt Photo Attachment & Secure Private Storage**:
    - Attach receipt images directly from mobile photo gallery or web file selector.
    - Live image preview with file size details and one-tap removal before saving.
-   - Attach or replace receipts on existing pending loans.
    - Strict file validation: JPEG, PNG, and WebP formats supported with binary magic bytes verification; 5MB size limit.
    - Private owner-scoped access: receipts are never public; only the loan's owner can view or download receipts via authenticated endpoints.
-   - Storage provider abstraction: supports private Supabase Storage buckets or local private storage. No service keys exposed to client.
 
-4. **High-Precision Financial Storage**:
+7. **High-Precision Financial Storage**:
    - Monetary values stored using PostgreSQL `Decimal(12,2)` (NUMERIC) to eliminate binary floating-point rounding errors.
    - Exact aggregation via Prisma Decimal arithmetic.
 
-5. **Automated Overdue Debt Classification**:
+8. **Automated Overdue Debt Classification**:
    - Outstanding loans whose `dueDate` is strictly earlier than today UTC are dynamically flagged as overdue.
    - Highlighted in red with warning icons and visual badges.
-   - Repaid loans are permanently immune to overdue status.
+   - Fully repaid loans are permanently immune to overdue status.
 
-6. **Safe Repayment Execution**:
-   - One-tap loan repayment with native confirmation prompt.
-   - Per-loan busy spinner and button disablement preventing duplicate submissions or race conditions.
-   - Immediate live recalculation of financial totals.
-
-7. **Strict Multi-User Isolation**:
-   - Every read, create, update, repayment, and receipt query is strictly scoped to the authenticated `req.userId` extracted from verified HS256 JWT tokens.
-   - Cross-user access or repayment attempts return `404 Loan not found`.
+9. **Strict Multi-User Isolation**:
+   - Every read, create, update, repayment, friend profile, and receipt query is strictly scoped to the authenticated `req.userId` extracted from verified HS256 JWT tokens.
+   - Cross-user access or repayment attempts return `404 Not Found`.
 
 ---
 
@@ -75,10 +87,11 @@ A functional full-stack personal finance demo application built to track money l
 graph TD
     subgraph Mobile ["📱 Mobile Client (React Native + Expo SDK 53)"]
         UI[App UI / Dashboard]
+        FriendPicker[Searchable Friend Selector]
+        FriendModal[Friend Profile Modal & Timeline]
+        RepayModal[Repayment Recorder Modal]
         AuthStore[AsyncStorage JWT Token]
-        Filter[Search & Status Filter]
         ReceiptPicker[ImagePicker + Preview]
-        PlatformCfg[Dynamic Platform API Resolution]
     end
 
     subgraph API ["⚡ REST API Server (Node.js + Express + TypeScript)"]
@@ -87,68 +100,82 @@ graph TD
         ZodVal[Zod Schema Validation Engine]
         OtpStore[In-Memory CSPRNG OTP Engine + Cooldown]
         StorageSvc[Receipt Storage Service & Magic Bytes]
+        TxEngine[Atomic Prisma Transactions]
         CalcEngine[Financial Calculation Engine]
     end
 
     subgraph Database ["🗄️ Database Layer (Supabase PostgreSQL)"]
-        Prisma[Prisma Client v6]
         UserTable[Users Table]
-        LoanTable[Loans Table: Decimal 12,2 + receiptPath]
-        Indexes[Composite Indexes: userId, status, dueDate]
+        FriendTable[Friends Table: normalizedName, normalizedPhone]
+        LoanTable[Loans Table: Decimal 12,2 + friendId + receiptPath]
+        RepaymentTable[Repayments Table: amount, loanId, note]
+        Indexes[Composite Indexes: userId, friendId, status, dueDate]
     end
 
-    UI --> PlatformCfg
-    PlatformCfg -->|HTTP / JSON| Router
+    UI --> FriendPicker
+    UI --> FriendModal
+    UI --> RepayModal
+    UI -->|HTTP / JSON| Router
     Router --> AuthMid
     AuthMid --> ZodVal
-    ZodVal --> Prisma
+    ZodVal --> TxEngine
+    TxEngine --> FriendTable
+    TxEngine --> LoanTable
+    TxEngine --> RepaymentTable
     ZodVal --> StorageSvc
     Router --> OtpStore
     Router --> CalcEngine
-    Prisma --> UserTable
-    Prisma --> LoanTable
-    LoanTable --> Indexes
+    UserTable --> FriendTable
+    FriendTable --> LoanTable
+    LoanTable --> RepaymentTable
 ```
 
 ---
 
-## 🔁 Authentication & Loan Lifecycle
+## 🔁 Friend Profiles & Repayment Lifecycle
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor User as Mobile User (App / Web)
     participant API as Express API (:4000)
-    participant Console as Backend Terminal
     participant DB as Supabase PostgreSQL
 
-    Note over User, API: 1. Phone + OTP Login Flow
-    User->>API: POST /api/auth/request-otp { phone: "9876543210" }
-    API->>Console: [MiniLedger OTP] Mobile: 9876543210 | Code: 467527
-    API-->>User: 200 OK { message: "OTP generated", expiresInSeconds: 300 }
-    Note over User: 60s cooldown timer starts in UI
-    User->>API: POST /api/auth/verify-otp { phone: "9876543210", otp: "467527" }
-    API->>DB: Upsert User (phone)
-    DB-->>API: User record (id, phone)
-    API-->>User: 200 OK { token: "JWT...", user: { id, phone } }
-    User->>User: Store token in AsyncStorage
+    Note over User, API: 1. Create or Select Friend Profile
+    User->>API: POST /api/friends { name: "Pooja Verma", phone: "+91 91234 56789" }
+    API->>DB: Check duplicates by normalizedName & normalizedPhone
+    alt Friend already exists
+        API-->>User: 409 Conflict { message: "Friend profile already exists", existingFriends: [...] }
+    else New Friend
+        API->>DB: INSERT INTO Friend (userId, name, normalizedName, phone, normalizedPhone)
+        DB-->>API: Created Friend Record
+        API-->>User: 201 Created { id, name, phone, ... }
+    end
 
-    Note over User, API: 2. Create Loan with Optional Receipt
-    User->>API: POST /api/loans (Bearer JWT) { friendName: "Riya", amount: 1500, dueDate: "2026-11-15", receipt: {...} }
-    API->>DB: INSERT INTO Loan (userId, friendName, amount, dueDate, PENDING, receiptPath)
+    Note over User, API: 2. Create Loan under Friend Profile
+    User->>API: POST /api/loans { friendId: "f_123", amount: 3000, dueDate: "2026-11-15" }
+    API->>DB: Verify friend ownership & INSERT Loan (friendId, userId, amount, dueDate, PENDING)
     DB-->>API: Saved Loan Record
-    API-->>User: 201 Created (hasReceipt: true)
+    API-->>User: 201 Created
 
-    Note over User, API: 3. View Receipt (Owner Only)
-    User->>API: GET /api/loans/:id/receipt?format=json (Bearer JWT)
-    API->>DB: Verify ownership (userId == req.userId)
-    API-->>User: 200 OK { url: "data:image/jpeg;base64,..." }
+    Note over User, API: 3. Record Partial Repayment with Note
+    User->>API: POST /api/loans/:id/repayments { amount: 1000, note: "UPI partial payment" }
+    API->>DB: BEGIN TRANSACTION
+    API->>DB: Verify loan ownership and calculate outstanding balance
+    alt Repayment amount > outstanding balance
+        API-->>User: 400 Bad Request { error: "Repayment amount exceeds outstanding balance" }
+    else Valid repayment
+        API->>DB: INSERT INTO Repayment (loanId, amount, note)
+        API->>DB: Update Loan (if balance == 0 -> REPAID, else PENDING)
+        API->>DB: COMMIT TRANSACTION
+        API-->>User: 201 Created { repayment, loan: { remainingAmount: 2000, status: "PENDING" } }
+    end
 
-    Note over User, API: 4. Repayment Flow
-    User->>API: PATCH /api/loans/:id/repay (Bearer JWT)
-    API->>DB: Verify ownership & UPDATE status = REPAID
-    DB-->>API: Updated Loan
-    API-->>User: 200 OK (repaid)
+    Note over User, API: 4. Inspect Detailed Friend Profile
+    User->>API: GET /api/friends/:id
+    API->>DB: Query Friend + Loans + Repayments (scoped to req.userId)
+    DB-->>API: Aggregated loans & repayments
+    API-->>User: 200 OK { friend, totalLent, totalRepaid, outstandingAmount, loans: [...] }
 ```
 
 ---
@@ -165,13 +192,13 @@ sequenceDiagram
 | **Language** | TypeScript 5.7+ / 5.8+ | Strict type safety across client and server codebases |
 | **Database** | PostgreSQL (Supabase) | Cloud relational storage with ACID compliance and session pooler |
 | **ORM** | Prisma ORM 6.19 | Declarative schema, migrations, type-safe query generation |
-| **Validation** | Zod 3.24 | Runtime payload parsing (phone numbers, amounts, dates, files) |
+| **Validation** | Zod 3.24 | Runtime payload parsing (friends, loans, repayments, files) |
 | **Security** | Helmet, CORS, JWT | Security headers, cross-origin rules, HS256-signed stateless tokens |
-| **Automated Testing**| Vitest 3.0 + Supertest 7.0 | In-memory Prisma test doubles, 56 unit and integration tests |
+| **Automated Testing**| Vitest 3.0 + Supertest 7.0 | In-memory Prisma test doubles, 75 unit and integration tests |
 
 ---
 
-## 🗄️ Database Schema & Prisma Configuration
+## 🗄️ Database Schema & Migration Safety
 
 The database schema is defined in [backend/prisma/schema.prisma](file:///c:/Users/Lenovo/Desktop/Projects/miniledger-starter/backend/prisma/schema.prisma):
 
@@ -190,9 +217,27 @@ model User {
   phone     String   @unique
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+  friends   Friend[]
   loans     Loan[]
 
   @@map("users")
+}
+
+model Friend {
+  id              String   @id @default(cuid())
+  userId          String
+  name            String   @db.VarChar(80)
+  normalizedName  String   @db.VarChar(80)
+  phone           String?  @db.VarChar(20)
+  normalizedPhone String?  @db.VarChar(20)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @default(now()) @updatedAt
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  loans           Loan[]
+
+  @@index([userId, normalizedName])
+  @@index([userId, normalizedPhone])
+  @@map("friends")
 }
 
 enum LoanStatus {
@@ -201,31 +246,47 @@ enum LoanStatus {
 }
 
 model Loan {
-  id                 String      @id @default(cuid())
-  userId             String
-  friendName         String      @db.VarChar(80)
-  amount             Decimal     @db.Decimal(12, 2)
-  dueDate            DateTime    @db.Date
-  status             LoanStatus  @default(PENDING)
-  createdAt          DateTime    @default(now())
-  updatedAt          DateTime    @default(now()) @updatedAt
-  repaidAt           DateTime?
-  receiptPath        String?     @db.VarChar(255)
-  receiptContentType String?     @db.VarChar(50)
-  user               User        @relation(fields: [userId], references: [id], onDelete: Cascade)
-  repayments         Repayment[]
+  id                  String      @id @default(cuid())
+  userId              String
+  friendId            String?
+  friendName          String      @db.VarChar(80)
+  amount              Decimal     @db.Decimal(12, 2)
+  dueDate             DateTime    @db.Date
+  status              LoanStatus  @default(PENDING)
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @default(now()) @updatedAt
+  repaidAt            DateTime?
+  receiptPath         String?     @db.VarChar(255)
+  receiptContentType  String?     @db.VarChar(50)
+  customOverdueAmount Decimal?    @db.Decimal(12, 2)
+  user                User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  friend              Friend?     @relation(fields: [friendId], references: [id], onDelete: SetNull)
+  repayments          Repayment[]
 
   @@index([userId, status, dueDate])
   @@index([userId, createdAt])
+  @@index([userId, friendId])
   @@map("loans")
+}
+
+model Repayment {
+  id        String   @id @default(cuid())
+  loanId    String
+  amount    Decimal  @db.Decimal(12, 2)
+  paidAt    DateTime @default(now())
+  note      String?  @db.VarChar(255)
+  loan      Loan     @relation(fields: [loanId], references: [id], onDelete: Cascade)
+
+  @@index([loanId, paidAt])
+  @@map("repayments")
 }
 ```
 
-### Key Schema Decisions:
-- **`Decimal(12, 2)`**: Guarantees currency accuracy up to ₹9,999,999,999.99 without IEEE 754 floating point distortion.
-- **`receiptPath` & `receiptContentType`**: Stores private storage reference and MIME type for receipt images.
-- **Cascade Deletes**: If a user is deleted, all associated loan records are automatically cleaned up.
-- **Composite Index `[userId, status, dueDate]`**: Optimizes multi-user summary queries, sorting, and overdue date filters.
+### Safe Backward-Compatible Migration Plan:
+1. **Zero Data Deletion**: Live database records (users, loans, repayments, receipts) are never dropped or recreated.
+2. **Backfill Phase**: Existing loans created before Phase 8 were safely migrated by grouping existing `(userId, friendName)` pairs, automatically creating corresponding `Friend` records, and populating `friendId` on every historical loan.
+3. **Foreign Key Safety**: `Loan.friendId` is linked with `onDelete: SetNull` and indexed on `[userId, friendId]` to maintain referential integrity.
+4. **Prisma Migration**: The complete DDL and backfill script is preserved under `backend/prisma/migrations/20261023190000_friend_profiles/migration.sql`.
 
 ---
 
@@ -247,11 +308,6 @@ JWT_SECRET="replace-with-a-long-random-secret-at-least-32-characters"
 
 PORT=4000
 NODE_ENV=development
-
-# Optional: Supabase Storage Configuration (if using a private Supabase bucket for receipts)
-# If omitted, receipts are stored securely in local private storage (uploads/receipts/)
-# SUPABASE_URL="https://YOUR_PROJECT_REF.supabase.co"
-# SUPABASE_SERVICE_ROLE_KEY="your-supabase-service-role-key"
 ```
 
 ### Mobile: `mobile/.env`
@@ -271,9 +327,6 @@ EXPO_PUBLIC_API_URL=http://localhost:4000
 # 3. Physical Device running Expo Go (use your computer's Wi-Fi LAN IP):
 # EXPO_PUBLIC_API_URL=http://192.168.1.XX:4000
 ```
-
-> [!NOTE]
-> When `EXPO_PUBLIC_API_URL` is not set, `App.tsx` automatically resolves to `http://10.0.2.2:4000` on Android devices and `http://localhost:4000` on Web and iOS.
 
 ---
 
@@ -304,7 +357,7 @@ npx expo start --web
 
 ---
 
-## 📲 Mock OTP & Receipt Demo Walkthrough
+## 📲 Demo Walkthrough
 
 1. Open **`http://localhost:8081`** in your browser.
 2. Enter any 10-digit Indian phone number (e.g., `9876543210`).
@@ -317,18 +370,31 @@ npx expo start --web
    ```
 5. Observe the live **60-second cooldown timer** on the Resend button (`Resend OTP in 59s...`).
 6. Enter the 6-digit code in the OTP field and tap **Verify & Log In**.
-7. The dashboard loads your user-scoped loans and financial totals.
-8. **Add an active loan with receipt photo**:
-   - Tap **+ Add Loan**, enter friend name `Riya Sharma`, amount `1500`, tap preset `+7 Days`.
-   - Tap **📷 Choose Receipt Photo** and select an image file. Preview appears with thumbnail and file size.
-   - Tap **Save Loan**. Notice the card appears with a **📷 Receipt** badge, and dashboard totals update by ₹1,500.00.
-   - Tap **📷 Receipt** on the card to open the secure receipt viewer modal.
-9. **Demonstrate overdue detection**:
-   - Tap **+ Add Loan**, enter friend name `Aman Verma`, amount `800`, and set the due date to **yesterday's date** (e.g. `2026-10-22`).
-   - Tap **Save Loan**. The card is immediately highlighted in soft red with a `● Overdue` badge and warning text, and the **Overdue Amount** summary updates to ₹800.00.
-10. **Demonstrate safe repayment**:
-    - Tap **Mark Repaid** on the first loan, confirm the dialog.
-    - The status changes to `✓ Repaid`, **Total Repaid** increases by ₹1,500.00, and **Outstanding** decreases accordingly.
+7. The dashboard loads your user-scoped friends and financial totals.
+8. **Main screen — one entry per friend**:
+   - Each friend profile is shown exactly once as a rich card.
+   - Each card displays their name, optional phone, total loans count, outstanding balance, overdue amount (if any), and latest activity date.
+   - Use the category filter chips (`All`, `Outstanding`, `Overdue`, `Settled`) and search bar to filter friends instantly.
+9. **Add a loan with friend selection**:
+   - Tap **+ Add Loan**.
+   - Notice the searchable friend selector displaying existing friends with their current balances.
+   - Choose an existing friend, or enter a new friend's name and optional phone.
+   - Enter amount `3000`, tap preset `+7 Days`, and tap **Save Loan**.
+10. **Open Friend Detail Screen & Complete History**:
+    - Tap any friend card on the dashboard to open their full **Friend Detail** modal screen.
+    - View friend-level summary: Total Lent, Total Repaid, Outstanding Balance, and Overdue Amount.
+    - Inspect the chronological timeline of all loans and repayment transactions.
+    - Tap **+ Add Loan to [Friend]** to record another loan directly under this same friend profile.
+11. **Record a Partial Repayment**:
+    - Under the pending loan, tap **Record Repay**.
+    - Enter `1000` and note `UPI payment 1st installment`.
+    - Tap **Submit Repayment**.
+    - Observe that the loan remains in `PENDING` status with remaining balance `₹2,000.00`, the repayment is recorded in the timeline with its timestamp and note, and the dashboard summary immediately reflects `₹1,000.00` repaid.
+12. **Test Overpayment Prevention**:
+    - Try to record a repayment exceeding remaining balance. Notice the system blocks overpayments with a clear alert.
+13. **Complete Full Repayment**:
+    - Tap **Full Repay** or submit the remaining balance.
+    - The loan automatically transitions to `✓ Repaid`, remaining balance becomes `₹0.00`, and all prior payment records remain preserved in the audit trail.
 
 ---
 
@@ -336,76 +402,98 @@ npx expo start --web
 
 Base URL: `http://localhost:4000`
 
-### 1. Health Check
-- **Endpoint**: `GET /api/health`
-- **Response**: `200 OK`
+### 1. Friend Endpoints
 
-### 2. Request Mock OTP
-- **Endpoint**: `POST /api/auth/request-otp` *(alias: `/api/auth/send-otp`)*
-- **Body**: `{ "phone": "9876543210" }`
-- **Response**: `200 OK`
-
-### 3. Verify OTP & Obtain JWT
-- **Endpoint**: `POST /api/auth/verify-otp`
-- **Body**: `{ "phone": "9876543210", "otp": "582194" }`
-- **Response**: `200 OK` (`{ token, user }`)
-
-### 4. List Loans
-- **Endpoint**: `GET /api/loans`
+#### List Friends
+- **Endpoint**: `GET /api/friends?search=Pooja`
 - **Headers**: `Authorization: Bearer <TOKEN>`
-- **Response**: `200 OK` (Array of user-scoped loans with `hasReceipt` and `receiptUrl`)
+- **Response**: `200 OK`
+```json
+[
+  {
+    "id": "cmvl4k3cq0001v0d8iwhj8c27",
+    "name": "Pooja Verma",
+    "phone": "+91 91234 56789",
+    "totalLent": 3000,
+    "totalRepaid": 1000,
+    "outstandingAmount": 2000,
+    "overdueAmount": 0,
+    "activeLoansCount": 1
+  }
+]
+```
 
-### 5. Create a Loan (with optional receipt)
+#### Create Friend
+- **Endpoint**: `POST /api/friends`
+- **Headers**: `Authorization: Bearer <TOKEN>`
+- **Body**:
+```json
+{
+  "name": "Pooja Verma",
+  "phone": "+91 91234 56789"
+}
+```
+- **Duplicate Response**: `409 Conflict`
+```json
+{
+  "error": "A friend with this name or phone already exists",
+  "existingFriends": [{ "id": "...", "name": "Pooja Verma" }]
+}
+```
+
+#### Get Friend Profile
+- **Endpoint**: `GET /api/friends/:id`
+- **Headers**: `Authorization: Bearer <TOKEN>`
+- **Response**: `200 OK` (Profile with full loan list, repayment history, and aggregated balances)
+
+---
+
+### 2. Loan Endpoints
+
+#### Create Loan
 - **Endpoint**: `POST /api/loans`
 - **Headers**: `Authorization: Bearer <TOKEN>`
 - **Body**:
 ```json
 {
-  "friendName": "Riya Sharma",
-  "amount": 1500,
+  "friendId": "cmvl4k3cq0001v0d8iwhj8c27",
+  "amount": 3000,
   "dueDate": "2026-11-15",
   "receipt": {
-    "imageBase64": "base64-encoded-string...",
+    "imageBase64": "...",
     "contentType": "image/jpeg"
   }
 }
 ```
 - **Response**: `201 Created`
 
-### 6. Attach Receipt to Existing Loan
-- **Endpoint**: `POST /api/loans/:id/receipt`
+#### List Loans
+- **Endpoint**: `GET /api/loans`
 - **Headers**: `Authorization: Bearer <TOKEN>`
-- **Body**: `{ "imageBase64": "...", "contentType": "image/jpeg" }`
-- **Response**: `200 OK` (Updated loan object)
+- **Response**: `200 OK` (Array of user-scoped loans with `friendId`, `friendName`, `repaidAmount`, `remainingAmount`, and `repayments`)
 
-### 7. View / Download Receipt (Owner Only)
-- **Endpoint**: `GET /api/loans/:id/receipt`
+#### Record Repayment
+- **Endpoint**: `POST /api/loans/:id/repayments`
 - **Headers**: `Authorization: Bearer <TOKEN>`
-- **Query**: `?format=json` returns `{ url: "data:image/jpeg;base64,..." }`
-- **Direct**: Serves image stream with `Content-Type: image/jpeg` and `Cache-Control: private`
-- **Cross-User Protection**: Returns `404 Not Found` if the loan belongs to another user.
+- **Body**:
+```json
+{
+  "amount": 1000.00,
+  "note": "UPI installment"
+}
+```
+- **Response**: `201 Created`
+```json
+{
+  "repayment": { "id": "...", "amount": "1000.00", "note": "UPI installment", "paidAt": "..." },
+  "loan": { "id": "...", "status": "PENDING", "remainingAmount": 2000.00 }
+}
+```
 
-### 8. Delete Receipt
-- **Endpoint**: `DELETE /api/loans/:id/receipt`
-- **Headers**: `Authorization: Bearer <TOKEN>`
-- **Response**: `200 OK` (Loan object with `receiptPath: null`)
-
-### 9. Custom Overdue Amount Override
-- **Endpoint**: `PATCH /api/loans/:id/overdue`
-- **Headers**: `Authorization: Bearer <TOKEN>`
-- **Body**: `{ "customOverdueAmount": 1250.00 }` (or `null` to reset to original loan amount)
-- **Response**: `200 OK` (Updated loan object with `customOverdueAmount`)
-- **Use Case**: Allows setting a customized overdue amount (e.g., adding late fee, penalty, or recording a negotiated amount).
-
-### 10. Repay a Loan
+#### Mark Full Repayment (Legacy Compatible)
 - **Endpoint**: `PATCH /api/loans/:id/repay`
 - **Headers**: `Authorization: Bearer <TOKEN>`
 - **Response**: `200 OK`
-
-### 11. Financial Summary
-- **Endpoint**: `GET /api/loans/summary`
-- **Headers**: `Authorization: Bearer <TOKEN>`
-- **Response**: `200 OK` (`{ totalLent, totalRepaid, overdueAmount, outstandingAmount }`)
 
 ---
 
@@ -413,12 +501,11 @@ Base URL: `http://localhost:4000`
 
 1. **Precision Rule**: Amounts are manipulated and stored via `Decimal` types, preventing `0.1 + 0.2 = 0.30000000000000004` errors.
 2. **Total Lent**: Sum of all loans created by the authenticated user (`PENDING` + `REPAID`).
-3. **Total Repaid**: Sum of all loans where `status = "REPAID"`.
+3. **Total Repaid**: Sum of all recorded repayment transactions associated with the user's loans.
 4. **Outstanding Amount**: Exactly `Total Lent - Total Repaid`.
-5. **Overdue Calculation**: Any loan where `status = "PENDING"` AND `dueDate < startOfTodayUTC`. Overdue loans default to their full `amount`, or their `customOverdueAmount` if manually set.
+5. **Overdue Calculation**: Any loan where `status = "PENDING"` AND `dueDate < startOfTodayUTC`. Overdue loans default to their remaining outstanding balance, or their `customOverdueAmount` if manually set.
 6. **Due Today Rule**: A loan due today is **not** overdue; it remains in pending status until the day expires.
 7. **Repaid Immunity**: Loans marked `REPAID` are permanently excluded from overdue totals, regardless of how far in the past their `dueDate` falls.
-8. **Custom Overdue Override**: Users can manually set or clear a custom overdue amount per loan via `PATCH /api/loans/:id/overdue` or in the Add Loan form.
 
 ---
 
@@ -438,16 +525,17 @@ npm run prisma:validate
 npm run build
 npm test
 ```
-*Expected: 62/62 tests passing across unit, middleware, auth, loans, receipt storage, and overdue suites.*
+*Expected: 75/75 tests passing across unit, middleware, auth, loans, friend profiles, repayment transactions, receipt storage, and overdue suites.*
 
 ### Test Suite Breakdown:
 - **API Health & Unknown Routes**: 2 tests.
 - **Phone Validation & OTP Generation**: 8 tests (Indian phone patterns, 60s cooldown, CSPRNG, prod log suppression).
 - **OTP Verification & User Upsert**: 7 tests (expiry, single-use enforcement, 5-attempt limit, timing-safe equality).
 - **JWT Middleware**: 5 tests (missing token, invalid token, algorithm restrictions, ghost user rejection).
-- **Loan Creation Validation**: 7 tests (name length, positive amount, 2 decimals max, valid calendar dates).
+- **Friend Profiles & Duplicate Prevention**: 8 tests (create friend, normalize whitespace/case, duplicate 409 conflict, list friends with balances, friend profile details, cross-user 404).
+- **Loan Creation Validation & Friend Association**: 8 tests (name length, positive amount, 2 decimals max, valid calendar dates, friendId association, cross-user friendId rejection).
+- **Recorded Repayments & Balance Precision**: 5 tests (partial repayment, multi-installment transition to REPAID, overpayment rejection, repayment notes audit trail, cross-user repayment rejection).
 - **Loan Listing & Multi-User Isolation**: 2 tests (scoped lists, user B isolation).
-- **Loan Repayment Security**: 4 tests (successful repay, invalid ID, cross-user 404, repeat 409).
 - **Summary Calculations & Overdue Semantics**: 6 tests (zero loans, Decimal precision, due today, repaid immunity, custom overdue summary reflection, pure logic).
 - **Receipt Storage & Image Validation**: 7 tests (JPEG/PNG/WebP magic bytes, non-image rejection, 5MB limit, disk storage lifecycle).
 - **Receipt API Endpoints & Security**: 9 tests (MIME type restrictions, corrupted magic byte rejection, cross-user attachment 404, cross-user view 404, unauthenticated 401, attach to existing, serve image, JSON data URL format, delete receipt).
@@ -466,12 +554,12 @@ npm test
 
 | Timestamp | Screen / Flow | Action & Narration |
 | :--- | :--- | :--- |
-| **0:00 – 0:25** | **Introduction & Architecture** | • Welcome the viewer to **MiniLedger**, a functional full-stack personal loan tracking demo application using mock OTP authentication.<br>• Briefly highlight the stack: React Native (Expo), Express, TypeScript, and Supabase PostgreSQL with Prisma ORM. |
-| **0:25 – 0:55** | **Mock OTP Login & Terminal Verification** | • Enter phone number `9876543210` and click **Send Mock OTP**.<br>• Switch to the backend terminal console to show that the 6-digit OTP code is logged directly to stdout for testing.<br>• Point out the live **60-second cooldown timer** on the Resend button (`Resend OTP in 58s`).<br>• Enter the 6-digit OTP code and click **Verify & Log In** to reach the dashboard. |
-| **0:55 – 1:30** | **Financial Summary Card & Add Loan with Receipt** | • Highlight the summary card showing Total Lent, Outstanding, Repaid, and Overdue.<br>• Click **+ Add Loan**.<br>• Enter friend's name (e.g., `Riya Sharma`), amount `1500`, and select preset `+7 Days`.<br>• Click **📷 Choose Receipt Photo**, select an image, show the thumbnail preview and file size.<br>• Click **Save Loan**; show instant dashboard summary update and the new loan card displaying the **📷 Receipt** badge.<br>• Click **📷 Receipt** on the card to open the secure receipt modal viewer. |
-| **1:30 – 1:55** | **Overdue Detection with Past Due Date** | • Click **+ Add Loan** again and enter friend's name (e.g., `Aman Verma`), amount `800`, and enter **yesterday's date** (e.g., `2026-10-22`).<br>• Save the loan and observe that it is immediately classified as **Overdue** (highlighted in soft red with a ⚠️ warning badge).<br>• Point out that the hero summary's **Overdue Amount** increases by ₹800.00 while the repaid loan remains unaffected.<br>• Click the **Overdue** filter tab to demonstrate instant category filtering and search. |
-| **1:55 – 2:20** | **Safe Repayment Flow & Live Balance Update** | • Click **Mark Repaid** on the first pending loan.<br>• Show the native confirmation modal and tap **Confirm Repay**.<br>• Observe the card badge switch to `✓ Repaid` and watch the financial hero card recalculate (Repaid increases, Outstanding decreases). |
-| **2:20 – 2:40** | **Multi-User Security & Conclusion** | • Mention that all queries and receipts are strictly scoped to `req.userId` with HS256 JWT tokens.<br>• Highlight the 56 passing automated tests covering all edge cases, storage validations, and financial precision.<br>• Conclude the demonstration. |
+| **0:00 – 0:25** | **Introduction & Architecture** | • Welcome the viewer to **MiniLedger**, now upgraded to a friend-centric lending tracker.<br>• Briefly highlight the stack: React Native (Expo SDK 53), Express, TypeScript, and Supabase PostgreSQL with Prisma ORM. |
+| **0:25 – 0:50** | **Mock OTP Login** | • Enter phone number `9876543210` and click **Send Mock OTP**.<br>• Check the backend terminal console to show the 6-digit OTP code.<br>• Enter the code and click **Verify & Log In** to reach the dashboard. |
+| **0:50 – 1:25** | **Friend Profiles & Add Loan** | • Click **+ Add Loan**.<br>• Show the searchable friend picker displaying current balances.<br>• Add a new friend `Pooja Verma` with phone number, select preset `+7 Days`, and save the loan.<br>• Demonstrate duplicate prevention: trying to add the same friend again warns with a duplicate conflict modal allowing direct profile selection. |
+| **1:25 – 1:55** | **Friend Profile Screen & Timeline** | • Tap Pooja Verma's name badge on the loan card.<br>• Show the Friend Profile modal: Total Lent, Total Repaid, Outstanding Balance, Overdue Amount, and the chronological timeline.<br>• Point out the "+ Lend More" button. |
+| **1:55 – 2:25** | **Recorded Partial Repayments & Overpayment Block** | • On the loan card, tap **Record Repay**.<br>• Try to enter an amount larger than outstanding debt to show the overpayment prevention error.<br>• Enter a partial repayment of ₹1,000 with a note `UPI installment 1`.<br>• Show the loan balance update to ₹2,000 remaining, and the payment entry appearing in the friend's timeline. |
+| **2:25 – 2:45** | **Receipt Viewer & Overdue Highlighting** | • Show an overdue loan highlighted in red with warning badges.<br>• Open a loan receipt photo in the secure private viewer modal.<br>• Conclude by highlighting the 75 passing automated tests and strict multi-user data isolation. |
 
 ---
 
@@ -484,3 +572,4 @@ npm test
    - Physical device or native emulator runs require configuring `EXPO_PUBLIC_API_URL` to the computer's Wi-Fi IP or Android emulator loopback (`10.0.2.2`).
 3. **No Secrets in Version Control**:
    - All real connection strings, Supabase keys, and JWT secrets are strictly managed in local `.env` files and excluded from git commits via `.gitignore`.
+

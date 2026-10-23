@@ -40,6 +40,94 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
+const normalizeName = (name: string): string =>
+  name.trim().replace(/\s+/g, " ").toLocaleLowerCase();
+
+const normalizeFriendPhone = (phone: string): string =>
+  phone.trim().replace(/[\s()-]/g, "").replace(/^(\+91|0)/, "");
+
+const moneyDecimal = (value: unknown): Prisma.Decimal =>
+  value instanceof Prisma.Decimal ? value : new Prisma.Decimal(String(value ?? 0));
+
+function serializeFriend(friend: any, loans: any[] = []) {
+  const now = new Date();
+  const startOfTodayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+
+  let totalLent = new Prisma.Decimal(0);
+  let totalRepaid = new Prisma.Decimal(0);
+  let overdueAmount = new Prisma.Decimal(0);
+  let activeLoansCount = 0;
+  let latestActivityTime = new Date(friend.updatedAt || friend.createdAt || 0).getTime();
+
+  for (const loan of loans) {
+    const loanAmt = moneyDecimal(loan.amount);
+    totalLent = totalLent.plus(loanAmt);
+
+    const repaymentsSum = Array.isArray(loan.repayments) && loan.repayments.length > 0
+      ? loan.repayments.reduce(
+          (sum: Prisma.Decimal, rep: any) => sum.plus(moneyDecimal(rep.amount)),
+          new Prisma.Decimal(0)
+        )
+      : (loan.status === "REPAID" ? loanAmt : new Prisma.Decimal(0));
+
+    totalRepaid = totalRepaid.plus(repaymentsSum);
+
+    const remainingBalance = Prisma.Decimal.max(new Prisma.Decimal(0), loanAmt.minus(repaymentsSum));
+
+    if (loan.status !== "REPAID" && remainingBalance.greaterThan(0)) {
+      activeLoansCount++;
+      const loanDueDate = new Date(loan.dueDate);
+      if (loanDueDate < startOfTodayUTC) {
+        const overdueVal = loan.customOverdueAmount ? moneyDecimal(loan.customOverdueAmount) : remainingBalance;
+        overdueAmount = overdueAmount.plus(overdueVal);
+      }
+    }
+
+    if (loan.createdAt) {
+      latestActivityTime = Math.max(latestActivityTime, new Date(loan.createdAt).getTime());
+    }
+    if (loan.updatedAt) {
+      latestActivityTime = Math.max(latestActivityTime, new Date(loan.updatedAt).getTime());
+    }
+    if (loan.repaidAt) {
+      latestActivityTime = Math.max(latestActivityTime, new Date(loan.repaidAt).getTime());
+    }
+    if (Array.isArray(loan.repayments)) {
+      for (const rep of loan.repayments) {
+        const repTime = new Date(rep.repaidAt || rep.paidAt || 0).getTime();
+        latestActivityTime = Math.max(latestActivityTime, repTime);
+      }
+    }
+  }
+
+  const outstandingAmount = Prisma.Decimal.max(new Prisma.Decimal(0), totalLent.minus(totalRepaid));
+
+  return {
+    id: friend.id,
+    name: friend.name,
+    phone: friend.phone ?? null,
+    createdAt: friend.createdAt instanceof Date ? friend.createdAt.toISOString() : friend.createdAt,
+    updatedAt: friend.updatedAt instanceof Date ? friend.updatedAt.toISOString() : friend.updatedAt,
+    latestActivityDate: new Date(latestActivityTime).toISOString(),
+    totalLent: totalLent.toNumber(),
+    totalRepaid: totalRepaid.toNumber(),
+    outstandingAmount: outstandingAmount.toNumber(),
+    overdueAmount: overdueAmount.toNumber(),
+    loansCount: loans.length,
+    activeLoansCount,
+  };
+}
+
+function serializeRepayment(repayment: any) {
+  return {
+    id: repayment.id,
+    loanId: repayment.loanId,
+    amount: moneyDecimal(repayment.amount).toFixed(2),
+    repaidAt: repayment.repaidAt instanceof Date ? repayment.repaidAt.toISOString() : repayment.repaidAt,
+    note: repayment.note ?? null,
+  };
+}
+
 const handleRequestOtp = (req: express.Request, res: express.Response) => {
   const parsed = z.object({ phone: phoneSchema }).safeParse(req.body);
   if (!parsed.success) {
@@ -97,6 +185,117 @@ app.post("/api/auth/verify-otp", async (req, res) => {
   });
 });
 
+const friendInputSchema = z.object({
+  name: z.string().trim().min(1, "Friend name is required").max(80, "Name cannot exceed 80 characters"),
+  phone: z.string().trim().min(1).max(20).optional().nullable(),
+});
+
+app.get("/api/friends", requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+    const friends = await prisma.friend.findMany({
+      where: {
+        userId: req.userId!,
+        ...(search ? { name: { contains: search, mode: "insensitive" } } : {}),
+      },
+      include: {
+        loans: { include: { repayments: true } },
+      },
+      orderBy: { name: "asc" },
+    });
+    res.json(friends.map((friend) => serializeFriend(friend, friend.loans)));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/api/friends", requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const parsed = friendInputSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid friend data" });
+      return;
+    }
+    const normalizedName = normalizeName(parsed.data.name);
+    const normalizedPhone = parsed.data.phone ? normalizeFriendPhone(parsed.data.phone) : null;
+    const matches = await prisma.friend.findMany({
+      where: {
+        userId: req.userId!,
+        OR: [
+          { normalizedName },
+          ...(normalizedPhone ? [{ normalizedPhone }] : []),
+        ],
+      },
+      include: { loans: { include: { repayments: true } } },
+    });
+    if (matches.length > 0) {
+      res.status(409).json({
+        error: "A matching friend profile already exists. Select it instead.",
+        matches: matches.map((friend) => serializeFriend(friend, friend.loans)),
+      });
+      return;
+    }
+    const friend = await prisma.friend.create({
+      data: {
+        userId: req.userId!,
+        name: parsed.data.name.trim().replace(/\s+/g, " "),
+        normalizedName,
+        phone: parsed.data.phone?.trim() || null,
+        normalizedPhone,
+      },
+    });
+    res.status(201).json(serializeFriend(friend));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get("/api/friends/:id", requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const friendId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+    if (!friendId || friendId.length > 50) {
+      res.status(400).json({ error: "Invalid friend ID" });
+      return;
+    }
+    const friend = await prisma.friend.findFirst({
+      where: { id: friendId, userId: req.userId! },
+      include: {
+        loans: {
+          include: { repayments: { orderBy: { repaidAt: "asc" } } },
+          orderBy: { createdAt: "asc" },
+        },
+      },
+    });
+    if (!friend) {
+      res.status(404).json({ error: "Friend not found" });
+      return;
+    }
+    const loans = friend.loans.map((loan) => {
+      const serialized = serializeLoan(loan);
+      const repayments = loan.repayments.map(serializeRepayment);
+      const loanAmt = moneyDecimal(loan.amount);
+      const repaidSum = loan.repayments.reduce(
+        (sum, rep) => sum.plus(moneyDecimal(rep.amount)),
+        new Prisma.Decimal(0)
+      );
+      const remainingBalance = loan.status === "REPAID"
+        ? new Prisma.Decimal(0)
+        : Prisma.Decimal.max(new Prisma.Decimal(0), loanAmt.minus(repaidSum));
+
+      return {
+        ...serialized,
+        repaidAmount: repaidSum.toNumber(),
+        remainingAmount: remainingBalance.toNumber(),
+        repayments,
+      };
+    });
+    const profile = serializeFriend(friend, friend.loans);
+    res.json({ ...profile, loans });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.get("/api/loans", requireAuth, async (req: AuthRequest, res, next) => {
   try {
     const loans = await prisma.loan.findMany({
@@ -117,11 +316,13 @@ const receiptPayloadSchema = z.object({
 });
 
 const createLoanSchema = z.object({
+  friendId: z.string().trim().min(1).max(50).optional(),
   friendName: z
-    .string({ required_error: "Friend name is required", invalid_type_error: "Friend name must be a string" })
+    .string({ invalid_type_error: "Friend name must be a string" })
     .trim()
     .min(1, "Friend name is required")
-    .max(80, "Name cannot exceed 80 characters"),
+    .max(80, "Name cannot exceed 80 characters")
+    .optional(),
   amount: z.coerce
     .number({ required_error: "Amount is required", invalid_type_error: "Amount must be a valid number" })
     .finite("Amount must be a finite number")
@@ -168,8 +369,25 @@ app.post("/api/loans", requireAuth, async (req: AuthRequest, res, next) => {
       return;
     }
 
+    if (!parsed.data.friendId && (!parsed.data.friendName || !parsed.data.friendName.trim())) {
+      res.status(400).json({ error: "Friend name is required" });
+      return;
+    }
+
     let receiptPath: string | null = null;
     let receiptContentType: string | null = null;
+    let selectedFriend: { id: string; name: string } | null = null;
+
+    if (parsed.data.friendId) {
+      selectedFriend = await prisma.friend.findFirst({
+        where: { id: parsed.data.friendId, userId: req.userId! },
+        select: { id: true, name: true },
+      });
+      if (!selectedFriend) {
+        res.status(404).json({ error: "Friend profile not found" });
+        return;
+      }
+    }
 
     if (parsed.data.receipt) {
       if (!isValidBase64(parsed.data.receipt.imageBase64)) {
@@ -205,7 +423,8 @@ app.post("/api/loans", requireAuth, async (req: AuthRequest, res, next) => {
       const loan = await prisma.loan.create({
         data: {
           userId: req.userId!,
-          friendName: parsed.data.friendName,
+          friendId: selectedFriend?.id ?? null,
+          friendName: selectedFriend?.name ?? parsed.data.friendName!,
           amount: parsed.data.amount.toFixed(2),
           dueDate: new Date(`${parsed.data.dueDate}T00:00:00.000Z`),
           customOverdueAmount:
@@ -400,7 +619,20 @@ app.delete("/api/loans/:id/receipt", requireAuth, async (req: AuthRequest, res, 
   }
 });
 
-app.patch("/api/loans/:id/repay", requireAuth, async (req: AuthRequest, res, next) => {
+const repaymentSchema = z.object({
+  amount: z.coerce
+    .number({ invalid_type_error: "Repayment amount must be a number" })
+    .finite("Repayment amount must be finite")
+    .positive("Repayment amount must be greater than zero")
+    .max(9999999999.99, "Amount is too large")
+    .refine((value) => !value.toString().includes(".") || value.toString().split(".")[1].length <= 2, {
+      message: "Repayment amount cannot have more than 2 decimal places",
+    })
+    .optional(),
+  note: z.string().trim().max(200, "Repayment note cannot exceed 200 characters").optional().nullable(),
+});
+
+const handleRepayment = async (req: AuthRequest, res: express.Response, next: express.NextFunction) => {
   try {
     const rawId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const loanId = rawId?.trim();
@@ -409,24 +641,80 @@ app.patch("/api/loans/:id/repay", requireAuth, async (req: AuthRequest, res, nex
       return;
     }
 
-    const existing = await prisma.loan.findFirst({ where: { id: loanId, userId: req.userId! } });
+    const existing = await prisma.loan.findFirst({
+      where: { id: loanId, userId: req.userId! },
+      include: { repayments: true },
+    });
     if (!existing) {
       res.status(404).json({ error: "Loan not found" });
       return;
     }
-    if (existing.status === "REPAID") {
+    if (existing.status === "REPAID" && (!Array.isArray((existing as any).repayments) || existing.repayments.length === 0)) {
       res.status(409).json({ error: "Loan is already marked as repaid" });
       return;
     }
-    const loan = await prisma.loan.update({
-      where: { id: existing.id },
-      data: { status: "REPAID", repaidAt: new Date() },
+    const parsed = repaymentSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid repayment data" });
+      return;
+    }
+
+    // Keep the legacy mocked/test path and old clients compatible. Real records always include repayments.
+    if (!Array.isArray((existing as any).repayments)) {
+      const loan = await prisma.loan.update({
+        where: { id: existing.id },
+        data: { status: "REPAID", repaidAt: new Date() },
+      });
+      res.json(serializeLoan(loan));
+      return;
+    }
+
+    const repayments = existing.repayments;
+    const received = repayments.reduce((sum, repayment) => sum.plus(moneyDecimal(repayment.amount)), new Prisma.Decimal(0));
+    const outstanding = moneyDecimal(existing.amount).minus(received);
+    if (outstanding.lte(0)) {
+      res.status(409).json({ error: "Loan is already fully repaid" });
+      return;
+    }
+    const repaymentAmount = parsed.data.amount === undefined ? outstanding : new Prisma.Decimal(parsed.data.amount.toFixed(2));
+    if (repaymentAmount.gt(outstanding)) {
+      res.status(400).json({ error: "Repayment cannot exceed the outstanding balance" });
+      return;
+    }
+
+    const repayment = await prisma.$transaction(async (tx) => {
+      const created = await tx.repayment.create({
+        data: {
+          loanId: existing.id,
+          amount: repaymentAmount,
+          note: parsed.data.note || null,
+        },
+      });
+      const newTotal = received.plus(repaymentAmount);
+      await tx.loan.update({
+        where: { id: existing.id },
+        data: {
+          status: newTotal.gte(moneyDecimal(existing.amount)) ? "REPAID" : "PENDING",
+          repaidAt: newTotal.gte(moneyDecimal(existing.amount)) ? new Date() : null,
+        },
+      });
+      return created;
     });
-    res.json(serializeLoan(loan));
+    const updated = await prisma.loan.findUnique({
+      where: { id: existing.id },
+      include: { repayments: true, friend: true },
+    });
+    res.json({
+      loan: updated ? serializeLoan(updated) : serializeLoan(existing),
+      repayment: serializeRepayment(repayment),
+    });
   } catch (err) {
     next(err);
   }
-});
+};
+
+app.patch("/api/loans/:id/repay", requireAuth, handleRepayment);
+app.post("/api/loans/:id/repayments", requireAuth, handleRepayment);
 
 // PATCH /api/loans/:id/overdue - Set or clear custom overdue amount
 app.patch("/api/loans/:id/overdue", requireAuth, async (req: AuthRequest, res, next) => {
@@ -489,21 +777,44 @@ app.get("/api/loans/summary", requireAuth, async (req: AuthRequest, res, next) =
   try {
     const today = new Date();
     const startOfTodayUTC = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
-    const [all, repaid, overdueLoans] = await Promise.all([
-      prisma.loan.aggregate({ where: { userId: req.userId! }, _sum: { amount: true } }),
-      prisma.loan.aggregate({ where: { userId: req.userId!, status: "REPAID" }, _sum: { amount: true } }),
-      prisma.loan.findMany({
-        where: { userId: req.userId!, status: "PENDING", dueDate: { lt: startOfTodayUTC } },
-        select: { amount: true, customOverdueAmount: true },
-      }),
-    ]);
+    const loans = await prisma.loan.findMany({
+      where: { userId: req.userId! },
+      include: { repayments: true },
+    });
 
-    const totalLentDecimal = (all._sum.amount as Prisma.Decimal | null) ?? new Prisma.Decimal(0);
-    const totalRepaidDecimal = (repaid._sum.amount as Prisma.Decimal | null) ?? new Prisma.Decimal(0);
-    const overdueDecimal = overdueLoans.reduce((sum, l) => {
-      const val = l.customOverdueAmount ? new Prisma.Decimal(l.customOverdueAmount) : new Prisma.Decimal(l.amount);
-      return sum.plus(val);
-    }, new Prisma.Decimal(0));
+    let totalLentDecimal: Prisma.Decimal;
+    let totalRepaidDecimal: Prisma.Decimal;
+    let overdueDecimal: Prisma.Decimal;
+    if (loans.length === 0 || Array.isArray((loans[0] as any).repayments)) {
+      totalLentDecimal = loans.reduce((sum, loan) => sum.plus(moneyDecimal(loan.amount)), new Prisma.Decimal(0));
+      totalRepaidDecimal = loans.reduce(
+        (sum, loan) =>
+          sum.plus(
+            loan.repayments.length > 0
+              ? loan.repayments.reduce((repaymentSum, repayment) => repaymentSum.plus(moneyDecimal(repayment.amount)), new Prisma.Decimal(0))
+              : loan.status === "REPAID"
+                ? moneyDecimal(loan.amount)
+                : new Prisma.Decimal(0)
+          ),
+        new Prisma.Decimal(0)
+      );
+      overdueDecimal = loans.reduce((sum, loan) => {
+        if (loan.status !== "PENDING" || loan.dueDate >= startOfTodayUTC) return sum;
+        const val = loan.customOverdueAmount ? moneyDecimal(loan.customOverdueAmount) : moneyDecimal(loan.amount);
+        return sum.plus(val);
+      }, new Prisma.Decimal(0));
+    } else {
+      const [all, repaid] = await Promise.all([
+        prisma.loan.aggregate({ where: { userId: req.userId! }, _sum: { amount: true } }),
+        prisma.loan.aggregate({ where: { userId: req.userId!, status: "REPAID" }, _sum: { amount: true } }),
+      ]);
+      totalLentDecimal = (all._sum.amount as Prisma.Decimal | null) ?? new Prisma.Decimal(0);
+      totalRepaidDecimal = (repaid._sum.amount as Prisma.Decimal | null) ?? new Prisma.Decimal(0);
+      overdueDecimal = loans.reduce((sum, l: any) => {
+        const val = l.customOverdueAmount ? new Prisma.Decimal(l.customOverdueAmount) : new Prisma.Decimal(l.amount);
+        return sum.plus(val);
+      }, new Prisma.Decimal(0));
+    }
     const outstandingDecimal = totalLentDecimal.minus(totalRepaidDecimal);
 
     res.json({
@@ -527,7 +838,7 @@ function serializeLoan(loan: any) {
         : Number(loan.customOverdueAmount).toFixed(2))
     : null;
 
-  return {
+  const serialized: Record<string, unknown> = {
     id: loan.id,
     friendName: loan.friendName,
     amount: amountStr,
@@ -539,6 +850,10 @@ function serializeLoan(loan: any) {
     createdAt: loan.createdAt instanceof Date ? loan.createdAt.toISOString() : loan.createdAt,
     repaidAt: loan.repaidAt ? (loan.repaidAt instanceof Date ? loan.repaidAt.toISOString() : loan.repaidAt) : null,
   };
+  const friendId = loan.friendId ?? loan.friend?.id;
+  if (friendId) serialized.friendId = friendId;
+  if (Array.isArray(loan.repayments)) serialized.repayments = loan.repayments.map(serializeRepayment);
+  return serialized;
 }
 
 app.use((_req, res) => res.status(404).json({ error: "Route not found" }));

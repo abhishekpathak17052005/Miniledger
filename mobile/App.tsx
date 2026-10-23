@@ -34,8 +34,17 @@ const getDefaultApiUrl = (): string => {
 
 const API_URL = getDefaultApiUrl();
 
+type Repayment = {
+  id: string;
+  loanId: string;
+  amount: string;
+  repaidAt: string;
+  note?: string | null;
+};
+
 type Loan = {
   id: string;
+  friendId?: string | null;
   friendName: string;
   amount: string;
   dueDate: string;
@@ -45,6 +54,28 @@ type Loan = {
   receiptUrl?: string | null;
   createdAt?: string;
   repaidAt?: string | null;
+  repaidAmount?: number;
+  remainingAmount?: number;
+  repayments?: Repayment[];
+};
+
+type Friend = {
+  id: string;
+  name: string;
+  phone?: string | null;
+  totalLent: number;
+  totalRepaid: number;
+  outstandingAmount: number;
+  overdueAmount: number;
+  loansCount: number;
+  activeLoansCount?: number;
+  latestActivityDate?: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type FriendProfile = Friend & {
+  loans: Loan[];
 };
 
 type Summary = {
@@ -54,7 +85,7 @@ type Summary = {
   outstandingAmount: number;
 };
 
-type FilterType = "ALL" | "PENDING" | "OVERDUE" | "REPAID";
+type FriendFilterType = "ALL" | "OUTSTANDING" | "OVERDUE" | "SETTLED";
 
 type SelectedReceipt = {
   uri: string;
@@ -67,6 +98,7 @@ type SelectedReceipt = {
 interface ApiError extends Error {
   status?: number;
   retryAfterSeconds?: number;
+  details?: Record<string, unknown>;
 }
 
 async function api<T>(path: string, token?: string, init: RequestInit = {}): Promise<T> {
@@ -97,6 +129,7 @@ async function api<T>(path: string, token?: string, init: RequestInit = {}): Pro
     const err: ApiError = new Error(message);
     err.status = response.status;
     err.retryAfterSeconds = body.retryAfterSeconds;
+    err.details = body;
     throw err;
   }
   return body as T;
@@ -126,6 +159,21 @@ const formatFileSize = (bytes?: number): string => {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 };
 
+const formatActivityDate = (dateStr?: string | null): string => {
+  if (!dateStr) return "Recently";
+  try {
+    const d = new Date(dateStr);
+    if (Number.isNaN(d.getTime())) return "Recently";
+    return d.toLocaleDateString("en-IN", {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    });
+  } catch {
+    return "Recently";
+  }
+};
+
 function AppContent() {
   const insets = useSafeAreaInsets();
   const [token, setToken] = useState<string | null>(null);
@@ -135,7 +183,7 @@ function AppContent() {
   const [otpSent, setOtpSent] = useState(false);
   const [cooldown, setCooldown] = useState(0);
 
-  const [loans, setLoans] = useState<Loan[]>([]);
+  const [friends, setFriends] = useState<Friend[]>([]);
   const [summary, setSummary] = useState<Summary>({
     totalLent: 0,
     totalRepaid: 0,
@@ -143,13 +191,28 @@ function AppContent() {
     outstandingAmount: 0,
   });
 
+  // Friend detail view state
+  const [viewingFriend, setViewingFriend] = useState<FriendProfile | null>(null);
+  const [loadingFriend, setLoadingFriend] = useState(false);
+
   // Form states
   const [friendName, setFriendName] = useState("");
+  const [friendPhone, setFriendPhone] = useState("");
+  const [selectedFriend, setSelectedFriend] = useState<Friend | null>(null);
+  const [friendSearch, setFriendSearch] = useState("");
   const [amount, setAmount] = useState("");
   const [dueDate, setDueDate] = useState(addDaysToDate(7));
   const [customOverdueInput, setCustomOverdueInput] = useState("");
   const [selectedReceipt, setSelectedReceipt] = useState<SelectedReceipt | null>(null);
   const [showForm, setShowForm] = useState(false);
+
+  // Duplicate conflict state
+  const [duplicateMatches, setDuplicateMatches] = useState<Friend[] | null>(null);
+
+  // Repayment form modal inside friend detail
+  const [repayingLoan, setRepayingLoan] = useState<Loan | null>(null);
+  const [repaymentAmountInput, setRepaymentAmountInput] = useState("");
+  const [repaymentNoteInput, setRepaymentNoteInput] = useState("");
 
   // Overdue amount modal states
   const [editingOverdueLoan, setEditingOverdueLoan] = useState<Loan | null>(null);
@@ -161,9 +224,9 @@ function AppContent() {
   const [viewingReceiptUrl, setViewingReceiptUrl] = useState<string | null>(null);
   const [loadingReceiptImage, setLoadingReceiptImage] = useState(false);
 
-  // Filter & Search states
+  // Filter & Search states (Friend level)
   const [searchQuery, setSearchQuery] = useState("");
-  const [activeFilter, setActiveFilter] = useState<FilterType>("ALL");
+  const [activeFriendFilter, setActiveFriendFilter] = useState<FriendFilterType>("ALL");
 
   // Interaction states
   const [busy, setBusy] = useState(false);
@@ -222,17 +285,32 @@ function AppContent() {
     if (!token) return;
     try {
       setRefreshing(true);
-      const [items, totals] = await Promise.all([
-        api<Loan[]>("/api/loans", token),
+      const [totals, friendItems] = await Promise.all([
         api<Summary>("/api/loans/summary", token),
+        api<Friend[]>("/api/friends", token),
       ]);
-      setLoans(items);
       setSummary(totals);
+      setFriends(friendItems);
       setError("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not load loans");
+      setError(e instanceof Error ? e.message : "Could not load data");
     } finally {
       setRefreshing(false);
+    }
+  }
+
+  async function openFriendProfile(friendId: string) {
+    setLoadingFriend(true);
+    try {
+      const profile = await api<FriendProfile>(`/api/friends/${friendId}`, token!);
+      setViewingFriend(profile);
+      setRepayingLoan(null);
+      setRepaymentAmountInput("");
+      setRepaymentNoteInput("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load friend profile");
+    } finally {
+      setLoadingFriend(false);
     }
   }
 
@@ -262,54 +340,58 @@ function AppContent() {
         res.message || "Check the backend terminal console to view your 6-digit OTP code."
       );
     } catch (e: any) {
-      const retrySec = e?.retryAfterSeconds;
-      if (retrySec && typeof retrySec === "number") {
-        setCooldown(retrySec);
+      if (e.status === 429 && e.retryAfterSeconds) {
+        setCooldown(e.retryAfterSeconds);
+        setOtpSent(true);
+        setError(`Please wait ${e.retryAfterSeconds}s before requesting a new OTP.`);
+      } else {
+        setError(e?.message || "Failed to request OTP. Try again.");
       }
-      setError(e instanceof Error ? e.message : "Could not request OTP");
     } finally {
       setBusy(false);
     }
   }
 
   async function verifyOtpCode() {
-    const normalized = normalizePhone(phone);
-    const cleanOtp = otp.trim();
-    if (!/^\d{6}$/.test(cleanOtp)) {
-      setError("Please enter the 6-digit OTP code");
+    const trimmedOtp = otp.trim();
+    if (!/^\d{6}$/.test(trimmedOtp)) {
+      setError("Please enter a valid 6-digit OTP code.");
       return;
     }
 
     setBusy(true);
     setError("");
     try {
-      const result = await api<{ token: string; user: { id: string; phone: string } }>(
+      const res = await api<{ token: string; user: { id: string; phone: string } }>(
         "/api/auth/verify-otp",
         undefined,
         {
           method: "POST",
-          body: JSON.stringify({ phone: normalized, otp: cleanOtp }),
+          body: JSON.stringify({ phone: normalizePhone(phone), otp: trimmedOtp }),
         }
       );
-      await AsyncStorage.setItem("miniledger_token", result.token);
-      await AsyncStorage.setItem("miniledger_phone", result.user.phone);
-      setUserPhone(result.user.phone);
-      setToken(result.token);
-      setSuccessMessage("Logged in successfully!");
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not verify OTP");
+      await AsyncStorage.setItem("miniledger_token", res.token);
+      await AsyncStorage.setItem("miniledger_phone", res.user.phone);
+      setToken(res.token);
+      setUserPhone(res.user.phone);
+      setOtp("");
+      setOtpSent(false);
+      setCooldown(0);
+      setSuccessMessage("Login successful! Welcome to MiniLedger.");
+    } catch (e: any) {
+      setError(e?.message || "Failed to verify OTP. Please try again.");
     } finally {
       setBusy(false);
     }
   }
 
-  async function pickReceiptImage() {
+  async function chooseReceiptPhoto() {
     try {
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!permission.granted) {
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== "granted") {
         Alert.alert(
           "Permission Required",
-          "Permission to access photo gallery is needed to attach a receipt."
+          "MiniLedger needs access to your photo library to attach receipt photos."
         );
         return;
       }
@@ -327,67 +409,89 @@ function AppContent() {
 
       const asset = result.assets[0];
       if (!asset.base64) {
-        setError("Could not read image content. Please try another photo.");
+        Alert.alert("Attachment Error", "Could not read image content. Please choose another image.");
         return;
       }
 
-      // Check size limit: 5MB
-      const approxBytes = Math.round((asset.base64.length * 3) / 4);
-      if (approxBytes > 5 * 1024 * 1024) {
-        setError("Receipt image exceeds maximum size of 5MB.");
-        return;
-      }
-
-      let mime: "image/jpeg" | "image/png" | "image/webp" = "image/jpeg";
-      if (asset.mimeType === "image/png" || asset.uri.toLowerCase().endsWith(".png")) {
-        mime = "image/png";
-      } else if (asset.mimeType === "image/webp" || asset.uri.toLowerCase().endsWith(".webp")) {
-        mime = "image/webp";
-      }
+      let contentType: "image/jpeg" | "image/png" | "image/webp" = "image/jpeg";
+      const uriLower = (asset.uri || "").toLowerCase();
+      if (uriLower.endsWith(".png")) contentType = "image/png";
+      else if (uriLower.endsWith(".webp")) contentType = "image/webp";
 
       setSelectedReceipt({
         uri: asset.uri,
         base64: asset.base64,
-        contentType: mime,
-        fileSize: asset.fileSize || approxBytes,
-        fileName: asset.fileName || "receipt_attachment",
+        contentType,
+        fileSize: asset.fileSize,
+        fileName: asset.fileName || "receipt.jpg",
       });
-      setError("");
-    } catch {
-      setError("Failed to open image picker. Please try again.");
+    } catch (err: any) {
+      Alert.alert("Attachment Error", err?.message || "Could not select photo.");
     }
   }
 
-  async function addLoan() {
-    const trimmedName = friendName.trim();
+  function removeSelectedReceipt() {
+    setSelectedReceipt(null);
+  }
+
+  async function handleAddLoan() {
+    let targetFriendId = selectedFriend?.id;
+    let targetFriendName = selectedFriend?.name;
+
+    if (!targetFriendId) {
+      const trimmedName = friendName.trim().replace(/\s+/g, " ");
+      if (!trimmedName) {
+        setError("Please choose an existing friend or enter a friend's name.");
+        return;
+      }
+      targetFriendName = trimmedName;
+
+      // Try to create the friend profile first
+      setBusy(true);
+      setError("");
+      try {
+        const createdFriend = await api<Friend>("/api/friends", token!, {
+          method: "POST",
+          body: JSON.stringify({
+            name: trimmedName,
+            phone: friendPhone.trim() || undefined,
+          }),
+        });
+        targetFriendId = createdFriend.id;
+        setSelectedFriend(createdFriend);
+      } catch (e: any) {
+        setBusy(false);
+        if (e.status === 409 && Array.isArray(e.details?.matches)) {
+          setDuplicateMatches(e.details.matches as Friend[]);
+          return;
+        }
+        setError(e?.message || "Could not register friend profile.");
+        return;
+      }
+    }
+
     const numericAmount = Number(amount);
-
-    if (!trimmedName) {
-      setError("Please enter your friend's name.");
-      return;
-    }
-    if (trimmedName.length > 80) {
-      setError("Friend name cannot exceed 80 characters.");
-      return;
-    }
-    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-      setError("Please enter a positive loan amount greater than ₹0.");
-      return;
-    }
-    const decimalParts = amount.includes(".") ? amount.split(".")[1] : "";
-    if (decimalParts.length > 2) {
-      setError("Amount cannot have more than 2 decimal places.");
-      return;
-    }
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || Number.isNaN(Date.parse(`${dueDate}T00:00:00Z`))) {
-      setError("Enter a valid due date in YYYY-MM-DD format.");
+    if (!amount.trim() || Number.isNaN(numericAmount) || numericAmount <= 0) {
+      setError("Please enter a valid loan amount greater than zero.");
+      setBusy(false);
       return;
     }
 
-    const customOverdueNum = customOverdueInput.trim() ? Number(customOverdueInput.trim()) : undefined;
-    if (customOverdueNum !== undefined && (!Number.isFinite(customOverdueNum) || customOverdueNum < 0)) {
-      setError("Custom overdue amount must be a valid positive number.");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) {
+      setError("Please enter a valid due date in YYYY-MM-DD format.");
+      setBusy(false);
       return;
+    }
+
+    let customOverdueNum: number | undefined = undefined;
+    if (customOverdueInput.trim()) {
+      const parsedNum = Number(customOverdueInput.trim());
+      if (Number.isNaN(parsedNum) || parsedNum < 0) {
+        setError("Custom overdue amount must be a valid positive number.");
+        setBusy(false);
+        return;
+      }
+      customOverdueNum = parsedNum;
     }
 
     setBusy(true);
@@ -396,7 +500,8 @@ function AppContent() {
       await api("/api/loans", token!, {
         method: "POST",
         body: JSON.stringify({
-          friendName: trimmedName,
+          friendId: targetFriendId,
+          friendName: targetFriendName,
           amount: numericAmount,
           dueDate,
           customOverdueAmount: customOverdueNum,
@@ -408,19 +513,110 @@ function AppContent() {
             : undefined,
         }),
       });
+
       setFriendName("");
+      setFriendPhone("");
+      setSelectedFriend(null);
+      setFriendSearch("");
       setAmount("");
       setDueDate(addDaysToDate(7));
       setCustomOverdueInput("");
       setSelectedReceipt(null);
       setShowForm(false);
-      setSuccessMessage(`Loan of ${rupees(numericAmount)} to ${trimmedName} recorded!`);
+      setSuccessMessage(`Loan of ${rupees(numericAmount)} to ${targetFriendName} recorded!`);
       await refresh();
+      if (viewingFriend && viewingFriend.id === targetFriendId) {
+        await openFriendProfile(targetFriendId);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not add loan");
     } finally {
       setBusy(false);
     }
+  }
+
+  async function recordLoanRepayment() {
+    if (!repayingLoan) return;
+    const loan = repayingLoan;
+    const remaining = loan.remainingAmount ?? (Number(loan.amount) - (loan.repaidAmount ?? 0));
+
+    let repayAmountVal: number | undefined = undefined;
+    if (repaymentAmountInput.trim()) {
+      const num = Number(repaymentAmountInput.trim());
+      if (Number.isNaN(num) || num <= 0) {
+        Alert.alert("Invalid Amount", "Please enter a valid positive repayment amount.");
+        return;
+      }
+      if (num > remaining + 0.001) {
+        Alert.alert(
+          "Overpayment Blocked",
+          `Repayment of ${rupees(num)} exceeds remaining balance of ${rupees(remaining)}.`
+        );
+        return;
+      }
+      repayAmountVal = num;
+    }
+
+    setBusy(true);
+    setRepayingId(loan.id);
+    try {
+      await api(`/api/loans/${loan.id}/repayments`, token!, {
+        method: "POST",
+        body: JSON.stringify({
+          amount: repayAmountVal,
+          note: repaymentNoteInput.trim() || undefined,
+        }),
+      });
+
+      setSuccessMessage(
+        repayAmountVal
+          ? `Repayment of ${rupees(repayAmountVal)} recorded!`
+          : "Full repayment recorded!"
+      );
+      setRepayingLoan(null);
+      setRepaymentAmountInput("");
+      setRepaymentNoteInput("");
+      await refresh();
+      if (viewingFriend) {
+        await openFriendProfile(viewingFriend.id);
+      }
+    } catch (e: any) {
+      Alert.alert("Repayment Error", e?.message || "Could not record repayment.");
+    } finally {
+      setBusy(false);
+      setRepayingId(null);
+    }
+  }
+
+  function confirmFullRepay(loan: Loan) {
+    Alert.alert(
+      "Confirm Full Repayment",
+      `Mark remaining debt on loan of ${rupees(loan.amount)} as fully repaid?`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Confirm Repay",
+          style: "default",
+          onPress: async () => {
+            setBusy(true);
+            setRepayingId(loan.id);
+            try {
+              await api(`/api/loans/${loan.id}/repay`, token!, { method: "PATCH" });
+              setSuccessMessage(`Loan marked as fully repaid!`);
+              await refresh();
+              if (viewingFriend) {
+                await openFriendProfile(viewingFriend.id);
+              }
+            } catch (e: any) {
+              Alert.alert("Repay Error", e?.message || "Could not mark loan as repaid.");
+            } finally {
+              setBusy(false);
+              setRepayingId(null);
+            }
+          },
+        },
+      ]
+    );
   }
 
   function openSetOverdueModal(loan: Loan) {
@@ -456,11 +652,14 @@ function AppContent() {
       });
       setSuccessMessage(
         payloadVal !== null
-          ? `Overdue amount for ${editingOverdueLoan.friendName} updated to ₹${payloadVal.toFixed(2)}`
-          : `Overdue amount for ${editingOverdueLoan.friendName} reset to original loan amount.`
+          ? `Overdue amount updated to ₹${payloadVal.toFixed(2)}`
+          : `Overdue amount reset to original loan amount.`
       );
       setEditingOverdueLoan(null);
       await refresh();
+      if (viewingFriend) {
+        await openFriendProfile(viewingFriend.id);
+      }
     } catch (err: any) {
       setOverdueModalError(err?.message || "Failed to update overdue amount.");
     } finally {
@@ -497,51 +696,53 @@ function AppContent() {
 
       if (result.canceled || !result.assets || result.assets.length === 0) return;
       const asset = result.assets[0];
-      if (!asset.base64) return;
-
-      const approxBytes = Math.round((asset.base64.length * 3) / 4);
-      if (approxBytes > 5 * 1024 * 1024) {
-        Alert.alert("File Too Large", "Receipt image must be smaller than 5MB.");
+      if (!asset.base64) {
+        Alert.alert("Upload Error", "Could not read image content.");
         return;
       }
 
-      let mime: "image/jpeg" | "image/png" | "image/webp" = "image/jpeg";
-      if (asset.mimeType === "image/png" || asset.uri.toLowerCase().endsWith(".png")) {
-        mime = "image/png";
-      } else if (asset.mimeType === "image/webp" || asset.uri.toLowerCase().endsWith(".webp")) {
-        mime = "image/webp";
-      }
+      let contentType: "image/jpeg" | "image/png" | "image/webp" = "image/jpeg";
+      const uriLower = (asset.uri || "").toLowerCase();
+      if (uriLower.endsWith(".png")) contentType = "image/png";
+      else if (uriLower.endsWith(".webp")) contentType = "image/webp";
 
       setBusy(true);
       await api(`/api/loans/${loan.id}/receipt`, token!, {
         method: "POST",
         body: JSON.stringify({
           imageBase64: asset.base64,
-          contentType: mime,
+          contentType,
         }),
       });
-      setSuccessMessage(`Receipt attached to loan for ${loan.friendName}!`);
+
+      setSuccessMessage("Receipt attached successfully!");
       await refresh();
+      if (viewingFriend) {
+        await openFriendProfile(viewingFriend.id);
+      }
     } catch (err: any) {
-      setError(err?.message || "Failed to attach receipt.");
+      Alert.alert("Upload Failed", err?.message || "Could not attach receipt.");
     } finally {
       setBusy(false);
     }
   }
 
-  async function deleteReceiptFromLoan(loan: Loan) {
-    Alert.alert("Delete Receipt", "Are you sure you want to remove this receipt photo?", [
+  async function deleteReceipt(loan: Loan) {
+    Alert.alert("Delete Receipt", "Remove receipt photo from this loan?", [
       { text: "Cancel", style: "cancel" },
       {
         text: "Delete",
         style: "destructive",
         onPress: async () => {
+          setBusy(true);
           try {
-            setBusy(true);
             await api(`/api/loans/${loan.id}/receipt`, token!, { method: "DELETE" });
             setViewingReceiptLoan(null);
             setSuccessMessage("Receipt removed successfully.");
             await refresh();
+            if (viewingFriend) {
+              await openFriendProfile(viewingFriend.id);
+            }
           } catch (err: any) {
             setError(err?.message || "Could not delete receipt.");
           } finally {
@@ -550,37 +751,6 @@ function AppContent() {
         },
       },
     ]);
-  }
-
-  function confirmRepayment(loan: Loan) {
-    if (busy || repayingId) return;
-    Alert.alert(
-      "Confirm Repayment",
-      `Mark loan of ${rupees(loan.amount)} to ${loan.friendName} as fully repaid?`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Confirm Repay",
-          style: "default",
-          onPress: () => void executeRepay(loan),
-        },
-      ]
-    );
-  }
-
-  async function executeRepay(loan: Loan) {
-    if (repayingId) return;
-    setRepayingId(loan.id);
-    setError("");
-    try {
-      await api(`/api/loans/${loan.id}/repay`, token!, { method: "PATCH" });
-      setSuccessMessage(`Loan to ${loan.friendName} marked as repaid!`);
-      await refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not mark loan as repaid");
-    } finally {
-      setRepayingId(null);
-    }
   }
 
   async function logout() {
@@ -597,7 +767,8 @@ function AppContent() {
           setOtp("");
           setOtpSent(false);
           setCooldown(0);
-          setLoans([]);
+          setFriends([]);
+          setViewingFriend(null);
           setError("");
           setSuccessMessage("");
         },
@@ -607,41 +778,41 @@ function AppContent() {
 
   const todayStr = getTodayDateString();
 
-  // Filter and search logic
-  const filteredLoans = useMemo(() => {
-    return loans.filter((loan) => {
-      const isOverdue = loan.status === "PENDING" && loan.dueDate < todayStr;
+  // Friend-level filtering and search
+  const filteredFriends = useMemo(() => {
+    return friends.filter((friend) => {
+      // Filter tab
+      if (activeFriendFilter === "OUTSTANDING" && !(friend.outstandingAmount > 0)) return false;
+      if (activeFriendFilter === "OVERDUE" && !(friend.overdueAmount > 0)) return false;
+      if (activeFriendFilter === "SETTLED" && friend.outstandingAmount > 0) return false;
 
-      // Filter category
-      if (activeFilter === "PENDING" && (loan.status !== "PENDING" || isOverdue)) return false;
-      if (activeFilter === "OVERDUE" && !isOverdue) return false;
-      if (activeFilter === "REPAID" && loan.status !== "REPAID") return false;
-
-      // Search query
+      // Search query (friend name or phone)
       if (searchQuery.trim()) {
-        const query = searchQuery.toLowerCase();
-        return (
-          loan.friendName.toLowerCase().includes(query) ||
-          loan.amount.includes(query) ||
-          loan.dueDate.includes(query)
-        );
+        const q = searchQuery.toLowerCase();
+        const matchesName = friend.name.toLowerCase().includes(q);
+        const matchesPhone = friend.phone ? friend.phone.toLowerCase().includes(q) : false;
+        return matchesName || matchesPhone;
       }
       return true;
     });
-  }, [loans, activeFilter, searchQuery, todayStr]);
+  }, [friends, activeFriendFilter, searchQuery]);
 
-  // Counts for filter pills
-  const counts = useMemo(() => {
-    let pending = 0;
+  const friendCounts = useMemo(() => {
+    let outstanding = 0;
     let overdue = 0;
-    let repaid = 0;
-    for (const l of loans) {
-      if (l.status === "REPAID") repaid++;
-      else if (l.dueDate < todayStr) overdue++;
-      else pending++;
+    let settled = 0;
+    for (const f of friends) {
+      if (f.overdueAmount > 0) overdue++;
+      if (f.outstandingAmount > 0) outstanding++;
+      else settled++;
     }
-    return { all: loans.length, pending, overdue, repaid };
-  }, [loans, todayStr]);
+    return { all: friends.length, outstanding, overdue, settled };
+  }, [friends]);
+
+  const selectableFriends = useMemo(() => {
+    const query = friendSearch.trim().toLowerCase();
+    return friends.filter((f) => !query || f.name.toLowerCase().includes(query));
+  }, [friends, friendSearch]);
 
   // Login View
   if (!token) {
@@ -686,7 +857,7 @@ function AppContent() {
 
             {otpSent && (
               <>
-                <Text style={styles.label}>ONE-TIME PASSWORD (OTP)</Text>
+                <Text style={styles.label}>6-DIGIT OTP CODE</Text>
                 <TextInput
                   style={[styles.input, styles.otpInput]}
                   value={otp}
@@ -696,7 +867,7 @@ function AppContent() {
                   }}
                   keyboardType="number-pad"
                   maxLength={6}
-                  placeholder="6-digit OTP"
+                  placeholder="• • • • • •"
                   placeholderTextColor="#A0AEC0"
                   editable={!busy}
                 />
@@ -706,51 +877,62 @@ function AppContent() {
             {!!error && <Text style={styles.error}>{error}</Text>}
             {!!successMessage && <Text style={styles.successBanner}>{successMessage}</Text>}
 
-            <Pressable
-              style={[styles.primary, busy && styles.buttonDisabled]}
-              disabled={busy}
-              onPress={() => void (otpSent ? verifyOtpCode() : requestOtpCode())}
-            >
-              {busy ? (
-                <ActivityIndicator color="white" />
-              ) : (
-                <Text style={styles.primaryText}>
-                  {otpSent ? "Verify & Log In" : "Send Mock OTP"}
-                </Text>
-              )}
-            </Pressable>
-
-            {otpSent && (
-              <View style={styles.otpActionsRow}>
+            {!otpSent ? (
+              <Pressable
+                style={[styles.primary, (busy || !phone.trim()) && styles.buttonDisabled]}
+                disabled={busy || !phone.trim()}
+                onPress={() => void requestOtpCode()}
+              >
+                {busy ? (
+                  <ActivityIndicator color="white" />
+                ) : (
+                  <Text style={styles.primaryText}>Send Mock OTP</Text>
+                )}
+              </Pressable>
+            ) : (
+              <>
                 <Pressable
-                  style={[styles.resendButton, (busy || cooldown > 0) && styles.buttonDisabled]}
-                  disabled={busy || cooldown > 0}
-                  onPress={() => void requestOtpCode()}
+                  style={[styles.primary, (busy || otp.trim().length !== 6) && styles.buttonDisabled]}
+                  disabled={busy || otp.trim().length !== 6}
+                  onPress={() => void verifyOtpCode()}
                 >
-                  <Text style={[styles.link, cooldown > 0 && styles.linkMuted]}>
-                    {cooldown > 0 ? `Resend OTP in ${cooldown}s` : "↻ Resend OTP"}
-                  </Text>
+                  {busy ? (
+                    <ActivityIndicator color="white" />
+                  ) : (
+                    <Text style={styles.primaryText}>Verify & Log In</Text>
+                  )}
                 </Pressable>
 
-                <Pressable
-                  style={styles.changePhoneButton}
-                  onPress={() => {
-                    setOtpSent(false);
-                    setOtp("");
-                    setError("");
-                    setSuccessMessage("");
-                  }}
-                >
-                  <Text style={styles.link}>← Change number</Text>
-                </Pressable>
-              </View>
+                <View style={styles.otpActionsRow}>
+                  <Pressable
+                    style={styles.resendButton}
+                    disabled={cooldown > 0 || busy}
+                    onPress={() => void requestOtpCode()}
+                  >
+                    <Text style={[styles.link, cooldown > 0 && styles.linkMuted]}>
+                      {cooldown > 0 ? `Resend OTP in ${cooldown}s` : "Resend OTP"}
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.changePhoneButton}
+                    disabled={busy}
+                    onPress={() => {
+                      setOtpSent(false);
+                      setOtp("");
+                      setError("");
+                    }}
+                  >
+                    <Text style={styles.link}>Change Number</Text>
+                  </Pressable>
+                </View>
+              </>
             )}
           </View>
 
           <View style={styles.demoNoteCard}>
-            <Text style={styles.demoNoteTitle}>Demo Verification Notice</Text>
+            <Text style={styles.demoNoteTitle}>💡 Internship Demo Mode Active</Text>
             <Text style={styles.demoNoteBody}>
-              For this technical assignment, OTPs are printed directly in the backend terminal console. Never hardcode an OTP in the application.
+              Mock OTP authentication is enabled. Check your backend terminal output to view the 6-digit verification code.
             </Text>
           </View>
         </KeyboardAvoidingView>
@@ -781,7 +963,7 @@ function AppContent() {
           <RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} tintColor="#2457E6" />
         }
       >
-        {/* Financial Summary Card */}
+        {/* Global Financial Summary Card */}
         <View style={styles.hero}>
           <View style={styles.heroHeaderRow}>
             <Text style={styles.heroLabel}>TOTAL LENT</Text>
@@ -810,9 +992,12 @@ function AppContent() {
           </View>
         </View>
 
+        {!!error && <Text style={styles.errorBanner}>{error}</Text>}
+        {!!successMessage && <Text style={styles.successBanner}>{successMessage}</Text>}
+
         {/* Section Header with Add Loan Button */}
         <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Loan Records ({loans.length})</Text>
+          <Text style={styles.sectionTitle}>Friends ({friends.length})</Text>
           <Pressable
             style={[styles.addButton, showForm && styles.addButtonCancel]}
             onPress={() => {
@@ -831,18 +1016,69 @@ function AppContent() {
           <View style={styles.panel}>
             <Text style={styles.heading}>Record New Loan</Text>
 
-            <Text style={styles.label}>FRIEND'S NAME</Text>
-            <TextInput
-              style={styles.input}
-              value={friendName}
-              onChangeText={(t) => {
-                setFriendName(t);
-                if (error) setError("");
-              }}
-              placeholder="e.g. Riya Sharma"
-              placeholderTextColor="#A0AEC0"
-              maxLength={80}
-            />
+            <Text style={styles.label}>SELECT OR ADD FRIEND</Text>
+            {selectedFriend ? (
+              <View style={styles.selectedFriend}>
+                <View style={styles.selectedFriendCopy}>
+                  <Text style={styles.selectedFriendName}>{selectedFriend.name}</Text>
+                  {selectedFriend.phone ? (
+                    <Text style={styles.selectedFriendPhone}>📞 {selectedFriend.phone}</Text>
+                  ) : null}
+                  <Text style={styles.selectedFriendBalance}>
+                    Current Outstanding: {rupees(selectedFriend.outstandingAmount)}
+                  </Text>
+                </View>
+                <Pressable onPress={() => setSelectedFriend(null)}>
+                  <Text style={styles.link}>Change</Text>
+                </Pressable>
+              </View>
+            ) : (
+              <>
+                <TextInput
+                  style={styles.input}
+                  value={friendSearch}
+                  onChangeText={setFriendSearch}
+                  placeholder="🔍 Search existing friends..."
+                  placeholderTextColor="#A0AEC0"
+                />
+                {selectableFriends.slice(0, 4).map((f) => (
+                  <Pressable
+                    key={f.id}
+                    style={styles.friendOption}
+                    onPress={() => {
+                      setSelectedFriend(f);
+                      setFriendSearch("");
+                    }}
+                  >
+                    <View>
+                      <Text style={styles.friendOptionName}>{f.name}</Text>
+                      {f.phone ? <Text style={styles.friendOptionPhone}>{f.phone}</Text> : null}
+                    </View>
+                    <Text style={styles.friendOptionBalance}>
+                      Outstanding: {rupees(f.outstandingAmount)}
+                    </Text>
+                  </Pressable>
+                ))}
+                <Text style={styles.orLabel}>OR ADD NEW FRIEND PROFILE</Text>
+                <TextInput
+                  style={styles.input}
+                  value={friendName}
+                  onChangeText={setFriendName}
+                  placeholder="Friend Name (e.g. Pooja Verma)"
+                  placeholderTextColor="#A0AEC0"
+                  maxLength={80}
+                />
+                <TextInput
+                  style={styles.input}
+                  value={friendPhone}
+                  onChangeText={setFriendPhone}
+                  placeholder="Phone number (optional, e.g. 9123456789)"
+                  placeholderTextColor="#A0AEC0"
+                  keyboardType="phone-pad"
+                  maxLength={15}
+                />
+              </>
+            )}
 
             <Text style={styles.label}>AMOUNT (₹)</Text>
             <TextInput
@@ -886,6 +1122,17 @@ function AppContent() {
               </Pressable>
             </View>
 
+            {/* Optional Custom Overdue Override */}
+            <Text style={styles.label}>CUSTOM OVERDUE AMOUNT (₹, OPTIONAL)</Text>
+            <TextInput
+              style={styles.input}
+              value={customOverdueInput}
+              onChangeText={setCustomOverdueInput}
+              placeholder="Leave blank to use full loan amount"
+              placeholderTextColor="#A0AEC0"
+              keyboardType="decimal-pad"
+            />
+
             {/* Receipt Photo Attachment */}
             <Text style={styles.label}>RECEIPT PHOTO (OPTIONAL)</Text>
             {selectedReceipt ? (
@@ -896,44 +1143,24 @@ function AppContent() {
                     {selectedReceipt.fileName}
                   </Text>
                   <Text style={styles.receiptFileSize}>
-                    {formatFileSize(selectedReceipt.fileSize)} ({selectedReceipt.contentType.replace("image/", "").toUpperCase()})
+                    {selectedReceipt.contentType.replace("image/", "").toUpperCase()} •{" "}
+                    {formatFileSize(selectedReceipt.fileSize)}
                   </Text>
                 </View>
-                <Pressable
-                  style={styles.removeReceiptButton}
-                  onPress={() => setSelectedReceipt(null)}
-                >
+                <Pressable style={styles.removeReceiptButton} onPress={removeSelectedReceipt}>
                   <Text style={styles.removeReceiptText}>✕ Remove</Text>
                 </Pressable>
               </View>
             ) : (
-              <Pressable
-                style={styles.attachReceiptButton}
-                onPress={() => void pickReceiptImage()}
-              >
-                <Text style={styles.attachReceiptText}>📷 Choose Receipt Photo (Gallery / File)</Text>
+              <Pressable style={styles.attachReceiptButton} onPress={() => void chooseReceiptPhoto()}>
+                <Text style={styles.attachReceiptText}>📷 Choose Receipt Photo</Text>
               </Pressable>
             )}
-
-            <Text style={styles.label}>CUSTOM OVERDUE AMOUNT (OPTIONAL)</Text>
-            <TextInput
-              style={styles.input}
-              value={customOverdueInput}
-              onChangeText={(t) => {
-                setCustomOverdueInput(t);
-                if (error) setError("");
-              }}
-              placeholder="Leave blank to default to original loan amount"
-              placeholderTextColor="#A0AEC0"
-              keyboardType="decimal-pad"
-            />
-
-            {!!error && <Text style={styles.error}>{error}</Text>}
 
             <Pressable
               style={[styles.primary, busy && styles.buttonDisabled]}
               disabled={busy}
-              onPress={() => void addLoan()}
+              onPress={() => void handleAddLoan()}
             >
               {busy ? (
                 <ActivityIndicator color="white" />
@@ -944,232 +1171,546 @@ function AppContent() {
           </View>
         )}
 
-        {/* Global Feedback Banners */}
-        {!!error && <Text style={styles.errorBanner}>{error}</Text>}
-        {!!successMessage && <Text style={styles.successBanner}>{successMessage}</Text>}
-
-        {/* Search & Filter Bar */}
+        {/* Search Input for Friends */}
         <View style={styles.searchWrap}>
           <TextInput
             style={styles.searchInput}
             value={searchQuery}
             onChangeText={setSearchQuery}
-            placeholder="🔍 Search friend, amount or date..."
-            placeholderTextColor="#8898AA"
+            placeholder="🔍 Search friends by name or phone..."
+            placeholderTextColor="#98A2B3"
           />
         </View>
 
-        {/* Filter Chips */}
+        {/* Friend Filter Chips */}
         <View style={styles.filterRow}>
           <Pressable
-            style={[styles.filterChip, activeFilter === "ALL" && styles.filterChipActive]}
-            onPress={() => setActiveFilter("ALL")}
+            style={[styles.filterChip, activeFriendFilter === "ALL" && styles.filterChipActive]}
+            onPress={() => setActiveFriendFilter("ALL")}
           >
-            <Text style={[styles.filterChipText, activeFilter === "ALL" && styles.filterChipTextActive]}>
-              All ({counts.all})
+            <Text
+              style={[styles.filterChipText, activeFriendFilter === "ALL" && styles.filterChipTextActive]}
+            >
+              All ({friendCounts.all})
             </Text>
           </Pressable>
 
           <Pressable
-            style={[styles.filterChip, activeFilter === "PENDING" && styles.filterChipActive]}
-            onPress={() => setActiveFilter("PENDING")}
+            style={[styles.filterChip, activeFriendFilter === "OUTSTANDING" && styles.filterChipActive]}
+            onPress={() => setActiveFriendFilter("OUTSTANDING")}
           >
-            <Text style={[styles.filterChipText, activeFilter === "PENDING" && styles.filterChipTextActive]}>
-              Pending ({counts.pending})
+            <Text
+              style={[
+                styles.filterChipText,
+                activeFriendFilter === "OUTSTANDING" && styles.filterChipTextActive,
+              ]}
+            >
+              Outstanding ({friendCounts.outstanding})
             </Text>
           </Pressable>
 
           <Pressable
             style={[
               styles.filterChip,
-              activeFilter === "OVERDUE" && styles.filterChipActiveOverdue,
+              activeFriendFilter === "OVERDUE" && styles.filterChipActiveOverdue,
             ]}
-            onPress={() => setActiveFilter("OVERDUE")}
+            onPress={() => setActiveFriendFilter("OVERDUE")}
           >
             <Text
               style={[
                 styles.filterChipText,
-                activeFilter === "OVERDUE" && styles.filterChipTextActiveOverdue,
+                activeFriendFilter === "OVERDUE" && styles.filterChipTextActiveOverdue,
               ]}
             >
-              Overdue ({counts.overdue})
+              Overdue ({friendCounts.overdue})
             </Text>
           </Pressable>
 
           <Pressable
-            style={[styles.filterChip, activeFilter === "REPAID" && styles.filterChipActiveRepaid]}
-            onPress={() => setActiveFilter("REPAID")}
+            style={[
+              styles.filterChip,
+              activeFriendFilter === "SETTLED" && styles.filterChipActiveRepaid,
+            ]}
+            onPress={() => setActiveFriendFilter("SETTLED")}
           >
             <Text
               style={[
                 styles.filterChipText,
-                activeFilter === "REPAID" && styles.filterChipTextActiveRepaid,
+                activeFriendFilter === "SETTLED" && styles.filterChipTextActiveRepaid,
               ]}
             >
-              Repaid ({counts.repaid})
+              Settled ({friendCounts.settled})
             </Text>
           </Pressable>
         </View>
 
-        {/* Loans List or Empty State */}
-        {filteredLoans.length === 0 ? (
+        {/* One Entry Per Friend List */}
+        {filteredFriends.length === 0 ? (
           <View style={styles.empty}>
-            <Text style={styles.emptyIcon}>📋</Text>
+            <Text style={styles.emptyIcon}>👥</Text>
             <Text style={styles.emptyTitle}>
-              {loans.length === 0 ? "No loans recorded yet" : "No matching loans found"}
+              {friends.length === 0 ? "No friend profiles yet" : "No matching friends found"}
             </Text>
             <Text style={styles.emptySubtitle}>
-              {loans.length === 0
-                ? "Tap '+ Add Loan' above to record your first entry."
-                : "Try clearing your search query or filter selection."}
+              {friends.length === 0
+                ? "Tap '+ Add Loan' above to create your first friend profile and record a loan."
+                : "Try adjusting your search query or status filter."}
             </Text>
           </View>
         ) : (
           <FlatList
             scrollEnabled={false}
-            data={filteredLoans}
+            data={filteredFriends}
             keyExtractor={(item) => item.id}
             renderItem={({ item }) => {
-              const isOverdue = item.status === "PENDING" && item.dueDate < todayStr;
-              const isItemRepaying = repayingId === item.id;
+              const isOverdue = item.overdueAmount > 0;
+              const isSettled = item.outstandingAmount === 0 && item.loansCount > 0;
               return (
-                <View
+                <Pressable
                   style={[
-                    styles.loanCard,
-                    isOverdue && styles.overdueCard,
-                    item.status === "REPAID" && styles.repaidCard,
+                    styles.friendCard,
+                    isOverdue && styles.friendCardOverdue,
+                    isSettled && styles.friendCardSettled,
                   ]}
+                  onPress={() => void openFriendProfile(item.id)}
                 >
-                  <View style={styles.loanTop}>
+                  <View style={styles.friendCardContent}>
                     <View
                       style={[
                         styles.avatar,
                         isOverdue && styles.avatarOverdue,
-                        item.status === "REPAID" && styles.avatarRepaid,
+                        isSettled && styles.avatarRepaid,
                       ]}
                     >
                       <Text
                         style={[
                           styles.avatarText,
                           isOverdue && styles.avatarTextOverdue,
-                          item.status === "REPAID" && styles.avatarTextRepaid,
+                          isSettled && styles.avatarTextRepaid,
                         ]}
                       >
-                        {item.friendName.trim().charAt(0).toUpperCase()}
+                        {item.name.trim().charAt(0).toUpperCase()}
                       </Text>
                     </View>
 
-                    <View style={styles.loanNameWrap}>
+                    <View style={styles.friendInfoWrap}>
                       <View style={styles.nameRow}>
-                        <Text style={styles.loanName}>{item.friendName}</Text>
-                        {item.hasReceipt && (
-                          <Pressable
-                            style={styles.receiptPill}
-                            onPress={() => void openReceiptViewer(item)}
-                          >
-                            <Text style={styles.receiptPillText}>📷 Receipt</Text>
-                          </Pressable>
+                        <Text style={styles.friendNameText}>{item.name}</Text>
+                        {isOverdue && (
+                          <View style={styles.overdueBadge}>
+                            <Text style={styles.overdueBadgeText}>⚠️ Overdue</Text>
+                          </View>
+                        )}
+                        {isSettled && (
+                          <View style={styles.settledBadge}>
+                            <Text style={styles.settledBadgeText}>✓ Settled</Text>
+                          </View>
                         )}
                       </View>
-                      <Text style={styles.loanDue}>
-                        {isOverdue ? `⚠️ Overdue since ${item.dueDate}` : `Due: ${item.dueDate}`}
-                      </Text>
-                      {isOverdue && item.customOverdueAmount && (
-                        <Text style={styles.customOverdueText}>
-                          Overdue: {rupees(item.customOverdueAmount)} (Custom)
+
+                      {item.phone ? (
+                        <Text style={styles.friendPhoneText}>📞 {item.phone}</Text>
+                      ) : null}
+
+                      <View style={styles.metaRow}>
+                        <Text style={styles.loansCountText}>
+                          {item.loansCount} {item.loansCount === 1 ? "loan" : "loans"}
                         </Text>
-                      )}
+                        <Text style={styles.metaBullet}>•</Text>
+                        <Text style={styles.activityDateText}>
+                          Activity: {formatActivityDate(item.latestActivityDate || item.updatedAt || item.createdAt)}
+                        </Text>
+                      </View>
                     </View>
 
-                    <Text
-                      style={[
-                        styles.loanAmount,
-                        isOverdue && styles.loanAmountOverdue,
-                        item.status === "REPAID" && styles.loanAmountRepaid,
-                      ]}
-                    >
-                      {rupees(item.amount)}
-                    </Text>
-                  </View>
-
-                  <View style={styles.loanBottom}>
-                    <View
-                      style={[
-                        styles.statusBadge,
-                        isOverdue && styles.badgeOverdue,
-                        item.status === "REPAID" && styles.badgeRepaid,
-                      ]}
-                    >
+                    <View style={styles.friendBalanceColumn}>
+                      <Text style={styles.balanceLabel}>OUTSTANDING</Text>
                       <Text
                         style={[
-                          styles.statusText,
-                          isOverdue && styles.statusTextOverdue,
-                          item.status === "REPAID" && styles.statusTextRepaid,
+                          styles.friendOutstandingAmount,
+                          isOverdue && styles.amountOverdue,
+                          isSettled && styles.amountSettled,
                         ]}
                       >
-                        {item.status === "REPAID"
-                          ? "✓ Repaid"
-                          : isOverdue
-                          ? "● Overdue"
-                          : "● Pending"}
+                        {rupees(item.outstandingAmount)}
                       </Text>
-                    </View>
-
-                    <View style={styles.loanActionsRow}>
-                      {isOverdue && item.status === "PENDING" && (
-                        <Pressable
-                          style={styles.setOverdueBtn}
-                          onPress={() => openSetOverdueModal(item)}
-                        >
-                          <Text style={styles.setOverdueBtnText}>
-                            {item.customOverdueAmount ? "✏️ Overdue" : "+ Overdue"}
-                          </Text>
-                        </Pressable>
+                      {isOverdue && (
+                        <Text style={styles.friendOverdueSubtext}>
+                          {rupees(item.overdueAmount)} overdue
+                        </Text>
                       )}
-
-                      {!item.hasReceipt && item.status === "PENDING" && (
-                        <Pressable
-                          style={styles.addReceiptBtn}
-                          onPress={() => void attachReceiptToExistingLoan(item)}
-                        >
-                          <Text style={styles.addReceiptBtnText}>+ Receipt</Text>
-                        </Pressable>
-                      )}
-
-                      {item.status === "PENDING" && (
-                        <Pressable
-                          style={[
-                            styles.repayButton,
-                            (busy || repayingId !== null) && styles.buttonDisabled,
-                          ]}
-                          disabled={busy || repayingId !== null}
-                          onPress={() => confirmRepayment(item)}
-                        >
-                          {isItemRepaying ? (
-                            <ActivityIndicator size="small" color="#175CD3" />
-                          ) : (
-                            <Text style={styles.repayButtonText}>Mark Repaid</Text>
-                          )}
-                        </Pressable>
-                      )}
+                      <Text style={styles.tapToViewText}>Tap for history ›</Text>
                     </View>
                   </View>
-                </View>
+                </Pressable>
               );
             }}
           />
         )}
 
         <Pressable style={styles.refresh} onPress={() => void refresh()}>
-          <Text style={styles.refreshText}>↻ Tap to refresh summary</Text>
+          <Text style={styles.refreshText}>↻ Tap to refresh</Text>
         </Pressable>
       </ScrollView>
+
+      {/* Friend Detail Screen (Modal) */}
+      <Modal
+        visible={viewingFriend !== null}
+        animationType="slide"
+        onRequestClose={() => setViewingFriend(null)}
+      >
+        <View style={styles.modalScreen}>
+          <View style={[styles.detailHeader, { paddingTop: insets.top + 8 }]}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.detailTitle}>{viewingFriend?.name}</Text>
+              <Text style={styles.detailSubtitle}>
+                {viewingFriend?.phone ? `📞 ${viewingFriend.phone} • ` : ""}
+                Member since {formatActivityDate(viewingFriend?.createdAt)}
+              </Text>
+            </View>
+            <Pressable style={styles.modalCloseButton} onPress={() => setViewingFriend(null)}>
+              <Text style={styles.modalCloseText}>✕</Text>
+            </Pressable>
+          </View>
+
+          {loadingFriend || !viewingFriend ? (
+            <ActivityIndicator color="#1F4FD6" style={styles.profileLoading} />
+          ) : (
+            <ScrollView contentContainerStyle={[styles.profileContent, { paddingBottom: insets.bottom + 40 }]}>
+              {/* Friend-Level Financial Summary Card */}
+              <View style={styles.friendSummaryHero}>
+                <View style={styles.friendHeroRow}>
+                  <Text style={styles.friendHeroLabel}>OUTSTANDING BALANCE</Text>
+                  {viewingFriend.overdueAmount > 0 && (
+                    <View style={styles.overdueBadge}>
+                      <Text style={styles.overdueBadgeText}>
+                        ⚠️ {rupees(viewingFriend.overdueAmount)} Overdue
+                      </Text>
+                    </View>
+                  )}
+                </View>
+                <Text style={styles.friendHeroBalance}>
+                  {rupees(viewingFriend.outstandingAmount)}
+                </Text>
+
+                <View style={styles.friendHeroGrid}>
+                  <View style={styles.statBox}>
+                    <Text style={styles.friendStatLabel}>TOTAL LENT</Text>
+                    <Text style={styles.friendStatValue}>{rupees(viewingFriend.totalLent)}</Text>
+                  </View>
+                  <View style={styles.statDivider} />
+                  <View style={styles.statBox}>
+                    <Text style={styles.friendStatLabel}>TOTAL REPAID</Text>
+                    <Text style={styles.friendStatValueRepaid}>
+                      {rupees(viewingFriend.totalRepaid)}
+                    </Text>
+                  </View>
+                  <View style={styles.statDivider} />
+                  <View style={styles.statBox}>
+                    <Text style={styles.friendStatLabel}>TOTAL LOANS</Text>
+                    <Text style={styles.friendStatValue}>{viewingFriend.loansCount}</Text>
+                  </View>
+                </View>
+              </View>
+
+              {/* Clear Action: Add Loan to this friend */}
+              <Pressable
+                style={styles.addLoanToFriendBtn}
+                onPress={() => {
+                  setSelectedFriend(viewingFriend);
+                  setViewingFriend(null);
+                  setShowForm(true);
+                }}
+              >
+                <Text style={styles.addLoanToFriendText}>
+                  + Add Loan to {viewingFriend.name}
+                </Text>
+              </Pressable>
+
+              <Text style={styles.historyTitle}>
+                Complete Loan & Repayment History ({viewingFriend.loans.length})
+              </Text>
+
+              {viewingFriend.loans.length === 0 ? (
+                <View style={styles.emptyHistoryBox}>
+                  <Text style={styles.emptyHistoryText}>
+                    No loans recorded for this friend yet.
+                  </Text>
+                </View>
+              ) : (
+                viewingFriend.loans.map((loan) => {
+                  const isOverdue = loan.status === "PENDING" && loan.dueDate < todayStr;
+                  const isRepaid = loan.status === "REPAID";
+                  const remaining =
+                    loan.remainingAmount ??
+                    (isRepaid ? 0 : Number(loan.amount) - (loan.repaidAmount ?? 0));
+
+                  return (
+                    <View
+                      key={loan.id}
+                      style={[
+                        styles.loanDetailCard,
+                        isOverdue && styles.overdueCard,
+                        isRepaid && styles.repaidCard,
+                      ]}
+                    >
+                      <View style={styles.loanDetailTop}>
+                        <View style={{ flex: 1 }}>
+                          <View style={styles.nameRow}>
+                            <Text style={styles.loanDetailAmount}>{rupees(loan.amount)}</Text>
+                            <View
+                              style={[
+                                styles.statusBadge,
+                                isOverdue && styles.badgeOverdue,
+                                isRepaid && styles.badgeRepaid,
+                              ]}
+                            >
+                              <Text
+                                style={[
+                                  styles.statusText,
+                                  isOverdue && styles.statusTextOverdue,
+                                  isRepaid && styles.statusTextRepaid,
+                                ]}
+                              >
+                                {isRepaid ? "✓ Repaid" : isOverdue ? "⚠️ Overdue" : "● Pending"}
+                              </Text>
+                            </View>
+                            {loan.hasReceipt && (
+                              <Pressable
+                                style={styles.receiptPill}
+                                onPress={() => void openReceiptViewer(loan)}
+                              >
+                                <Text style={styles.receiptPillText}>📷 Receipt</Text>
+                              </Pressable>
+                            )}
+                          </View>
+
+                          <Text style={styles.loanDetailDates}>
+                            Lent: {formatActivityDate(loan.createdAt)} •{" "}
+                            {isOverdue ? `⚠️ Due: ${loan.dueDate}` : `Due: ${loan.dueDate}`}
+                          </Text>
+
+                          {!isRepaid && (
+                            <Text style={styles.loanRemainingText}>
+                              Remaining:{" "}
+                              <Text style={{ fontWeight: "900", color: isOverdue ? "#D92D20" : "#101828" }}>
+                                {rupees(remaining)}
+                              </Text>
+                            </Text>
+                          )}
+
+                          {isOverdue && loan.customOverdueAmount && (
+                            <Text style={styles.customOverdueText}>
+                              Custom Overdue: {rupees(loan.customOverdueAmount)}
+                            </Text>
+                          )}
+                        </View>
+                      </View>
+
+                      {/* Repayment Transactions List */}
+                      {!!loan.repayments?.length && (
+                        <View style={styles.repaymentSection}>
+                          <Text style={styles.repaymentSectionTitle}>Repayment Transactions:</Text>
+                          {loan.repayments.map((rep) => (
+                            <View key={rep.id} style={styles.repaymentRow}>
+                              <Text style={styles.repaymentRowAmount}>+ {rupees(rep.amount)}</Text>
+                              <Text style={styles.repaymentRowDate}>
+                                on {formatActivityDate(rep.repaidAt)}
+                                {rep.note ? ` • "${rep.note}"` : ""}
+                              </Text>
+                            </View>
+                          ))}
+                        </View>
+                      )}
+
+                      {/* Action buttons on this loan */}
+                      {!isRepaid && (
+                        <View style={styles.loanActionsBar}>
+                          <Pressable
+                            style={styles.recordRepayBtn}
+                            onPress={() => {
+                              setRepayingLoan(loan);
+                              setRepaymentAmountInput(remaining.toFixed(2));
+                              setRepaymentNoteInput("");
+                            }}
+                          >
+                            <Text style={styles.recordRepayBtnText}>Record Repay</Text>
+                          </Pressable>
+
+                          <Pressable
+                            style={styles.fullRepayBtn}
+                            onPress={() => confirmFullRepay(loan)}
+                          >
+                            <Text style={styles.fullRepayBtnText}>Full Repay</Text>
+                          </Pressable>
+
+                          {!loan.hasReceipt && (
+                            <Pressable
+                              style={styles.addReceiptBtn}
+                              onPress={() => void attachReceiptToExistingLoan(loan)}
+                            >
+                              <Text style={styles.addReceiptBtnText}>+ Receipt</Text>
+                            </Pressable>
+                          )}
+
+                          {isOverdue && (
+                            <Pressable
+                              style={styles.setOverdueBtn}
+                              onPress={() => openSetOverdueModal(loan)}
+                            >
+                              <Text style={styles.setOverdueBtnText}>
+                                {loan.customOverdueAmount ? "✏️ Overdue" : "+ Overdue"}
+                              </Text>
+                            </Pressable>
+                          )}
+                        </View>
+                      )}
+                    </View>
+                  );
+                })
+              )}
+            </ScrollView>
+          )}
+        </View>
+      </Modal>
+
+      {/* Record Repayment Modal */}
+      <Modal
+        visible={repayingLoan !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setRepayingLoan(null)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitle}>Record Repayment</Text>
+                <Text style={styles.modalSubtitle}>
+                  {repayingLoan?.friendName} • Total Loan: {rupees(repayingLoan?.amount || 0)}
+                </Text>
+              </View>
+              <Pressable
+                style={styles.modalCloseButton}
+                onPress={() => setRepayingLoan(null)}
+              >
+                <Text style={styles.modalCloseText}>✕</Text>
+              </Pressable>
+            </View>
+
+            <View style={{ padding: 16 }}>
+              <Text style={styles.label}>REPAYMENT AMOUNT (₹)</Text>
+              <TextInput
+                style={styles.input}
+                value={repaymentAmountInput}
+                onChangeText={setRepaymentAmountInput}
+                placeholder="Enter amount (partial or full)"
+                placeholderTextColor="#A0AEC0"
+                keyboardType="decimal-pad"
+              />
+
+              <Text style={styles.label}>NOTE / REMARKS (OPTIONAL)</Text>
+              <TextInput
+                style={styles.input}
+                value={repaymentNoteInput}
+                onChangeText={setRepaymentNoteInput}
+                placeholder="e.g. UPI installment, cash payment"
+                placeholderTextColor="#A0AEC0"
+                maxLength={200}
+              />
+            </View>
+
+            <View style={styles.modalFooter}>
+              <Pressable
+                style={styles.modalDeleteButton}
+                onPress={() => setRepayingLoan(null)}
+              >
+                <Text style={styles.modalDeleteText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.modalDoneButton, busy && styles.buttonDisabled]}
+                disabled={busy}
+                onPress={() => void recordLoanRepayment()}
+              >
+                {busy ? (
+                  <ActivityIndicator color="white" />
+                ) : (
+                  <Text style={styles.modalDoneText}>Submit Repayment</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Duplicate Conflict Resolution Modal */}
+      <Modal
+        visible={duplicateMatches !== null && duplicateMatches.length > 0}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setDuplicateMatches(null)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <View>
+                <Text style={styles.modalTitle}>Friend Profile Already Exists</Text>
+                <Text style={styles.modalSubtitle}>
+                  A matching profile was found. Select it to prevent accidental duplicates:
+                </Text>
+              </View>
+              <Pressable
+                style={styles.modalCloseButton}
+                onPress={() => setDuplicateMatches(null)}
+              >
+                <Text style={styles.modalCloseText}>✕</Text>
+              </Pressable>
+            </View>
+
+            <View style={{ padding: 12 }}>
+              {duplicateMatches?.map((match) => (
+                <View key={match.id} style={styles.duplicateMatchBox}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.duplicateMatchName}>{match.name}</Text>
+                    {match.phone ? (
+                      <Text style={styles.duplicateMatchPhone}>📞 {match.phone}</Text>
+                    ) : null}
+                    <Text style={styles.duplicateMatchBalance}>
+                      Outstanding: {rupees(match.outstandingAmount)}
+                    </Text>
+                  </View>
+                  <Pressable
+                    style={styles.useProfileBtn}
+                    onPress={() => {
+                      setSelectedFriend(match);
+                      setFriendName("");
+                      setFriendPhone("");
+                      setDuplicateMatches(null);
+                    }}
+                  >
+                    <Text style={styles.useProfileBtnText}>Use Profile</Text>
+                  </Pressable>
+                </View>
+              ))}
+            </View>
+
+            <View style={styles.modalFooter}>
+              <Pressable
+                style={styles.modalDeleteButton}
+                onPress={() => setDuplicateMatches(null)}
+              >
+                <Text style={styles.modalDeleteText}>Cancel</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       {/* Receipt Viewer Modal */}
       <Modal
         visible={viewingReceiptLoan !== null}
-        animationType="slide"
         transparent
+        animationType="fade"
         onRequestClose={() => setViewingReceiptLoan(null)}
       >
         <View style={styles.modalBackdrop}>
@@ -1178,7 +1719,7 @@ function AppContent() {
               <View>
                 <Text style={styles.modalTitle}>Receipt Attachment</Text>
                 <Text style={styles.modalSubtitle}>
-                  Loan for {viewingReceiptLoan?.friendName} ({rupees(viewingReceiptLoan?.amount || 0)})
+                  {viewingReceiptLoan?.friendName} · {rupees(viewingReceiptLoan?.amount || 0)}
                 </Text>
               </View>
               <Pressable
@@ -1202,7 +1743,7 @@ function AppContent() {
                   resizeMode="contain"
                 />
               ) : (
-                <Text style={styles.modalErrorText}>Receipt image not available.</Text>
+                <Text style={styles.modalErrorText}>Could not load receipt photo.</Text>
               )}
             </View>
 
@@ -1210,31 +1751,31 @@ function AppContent() {
               {viewingReceiptLoan && (
                 <Pressable
                   style={styles.modalDeleteButton}
-                  onPress={() => void deleteReceiptFromLoan(viewingReceiptLoan)}
+                  onPress={() => void deleteReceipt(viewingReceiptLoan)}
                 >
-                  <Text style={styles.modalDeleteText}>🗑 Remove Receipt</Text>
+                  <Text style={styles.modalDeleteText}>🗑️ Delete Receipt</Text>
                 </Pressable>
               )}
               <Pressable
                 style={styles.modalDoneButton}
                 onPress={() => setViewingReceiptLoan(null)}
               >
-                <Text style={styles.modalDoneText}>Close</Text>
+                <Text style={styles.modalDoneText}>Done</Text>
               </Pressable>
             </View>
           </View>
         </View>
       </Modal>
 
-      {/* Overdue Amount Modal */}
+      {/* Custom Overdue Amount Modal */}
       <Modal
         visible={editingOverdueLoan !== null}
-        animationType="fade"
         transparent
+        animationType="fade"
         onRequestClose={() => setEditingOverdueLoan(null)}
       >
         <View style={styles.modalBackdrop}>
-          <View style={[styles.modalCard, { maxHeight: 420 }]}>
+          <View style={styles.modalCard}>
             <View style={styles.modalHeader}>
               <View>
                 <Text style={styles.modalTitle}>Set Overdue Amount</Text>
@@ -1250,7 +1791,7 @@ function AppContent() {
               </Pressable>
             </View>
 
-            <View style={{ padding: 20 }}>
+            <View style={{ padding: 16 }}>
               <Text style={styles.overdueModalHint}>
                 Specify a customized overdue amount (e.g. adding a late fee, penalty, or negotiated reduction). Leaving blank or resetting uses the original loan amount.
               </Text>
@@ -1436,6 +1977,34 @@ const styles = StyleSheet.create({
   },
   logoutText: { color: "#344054", fontWeight: "700", fontSize: 12 },
   content: { paddingHorizontal: 18, paddingTop: 6 },
+  selectedFriend: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#EFF8FF",
+    borderWidth: 1,
+    borderColor: "#B2DDFF",
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 6,
+  },
+  selectedFriendCopy: { flex: 1 },
+  selectedFriendName: { color: "#101828", fontWeight: "800", fontSize: 15 },
+  selectedFriendPhone: { color: "#667085", fontSize: 12, marginTop: 2 },
+  selectedFriendBalance: { color: "#175CD3", fontSize: 12, fontWeight: "700", marginTop: 4 },
+  friendOption: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#EAECF0",
+  },
+  friendOptionName: { color: "#101828", fontWeight: "700", fontSize: 14 },
+  friendOptionPhone: { color: "#667085", fontSize: 11, marginTop: 1 },
+  friendOptionBalance: { color: "#175CD3", fontSize: 12, fontWeight: "700" },
+  orLabel: { color: "#98A2B3", fontSize: 10, fontWeight: "800", letterSpacing: 0.7, marginTop: 12, marginBottom: 4 },
   sectionTitle: { fontSize: 18, fontWeight: "800", color: "#101828" },
   hero: {
     backgroundColor: "#163AB0",
@@ -1580,7 +2149,9 @@ const styles = StyleSheet.create({
   filterChipTextActive: { color: "white" },
   filterChipTextActiveOverdue: { color: "white" },
   filterChipTextActiveRepaid: { color: "white" },
-  loanCard: {
+
+  // Friend Card Styles (Dashboard - One entry per friend)
+  friendCard: {
     backgroundColor: "white",
     borderRadius: 16,
     padding: 16,
@@ -1593,18 +2164,21 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
     elevation: 1,
   },
-  overdueCard: {
+  friendCardOverdue: {
     borderColor: "#FDA29B",
     backgroundColor: "#FFFBFA",
   },
-  repaidCard: {
+  friendCardSettled: {
     borderColor: "#ABEFC6",
     backgroundColor: "#F6FEF9",
   },
-  loanTop: { flexDirection: "row", alignItems: "center" },
+  friendCardContent: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
   avatar: {
-    width: 44,
-    height: 44,
+    width: 46,
+    height: 46,
     borderRadius: 14,
     backgroundColor: "#EFF8FF",
     alignItems: "center",
@@ -1615,62 +2189,38 @@ const styles = StyleSheet.create({
   avatarText: { color: "#1F4FD6", fontSize: 18, fontWeight: "900" },
   avatarTextOverdue: { color: "#D92D20" },
   avatarTextRepaid: { color: "#079455" },
-  loanNameWrap: { flex: 1, marginLeft: 12 },
+  friendInfoWrap: { flex: 1, marginLeft: 12 },
   nameRow: { flexDirection: "row", alignItems: "center", flexWrap: "wrap" },
-  loanName: { fontSize: 16, color: "#101828", fontWeight: "800", marginRight: 6 },
-  receiptPill: {
-    backgroundColor: "#EFF8FF",
-    borderColor: "#B2DDFF",
-    borderWidth: 1,
+  friendNameText: { fontSize: 16, color: "#101828", fontWeight: "800", marginRight: 6 },
+  friendPhoneText: { fontSize: 12, color: "#667085", marginTop: 2 },
+  metaRow: { flexDirection: "row", alignItems: "center", marginTop: 4 },
+  loansCountText: { fontSize: 11, color: "#475467", fontWeight: "700" },
+  metaBullet: { fontSize: 11, color: "#98A2B3", marginHorizontal: 5 },
+  activityDateText: { fontSize: 11, color: "#667085" },
+  overdueBadge: {
+    backgroundColor: "#FEE4E2",
     paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 6,
+    marginLeft: 4,
   },
-  receiptPillText: { fontSize: 10, color: "#175CD3", fontWeight: "800" },
-  loanDue: { fontSize: 12, color: "#667085", marginTop: 3 },
-  loanAmount: { color: "#101828", fontWeight: "900", fontSize: 16 },
-  loanAmountOverdue: { color: "#D92D20" },
-  loanAmountRepaid: { color: "#079455" },
-  loanBottom: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    borderTopWidth: 1,
-    borderTopColor: "#F2F4F7",
-    marginTop: 12,
-    paddingTop: 10,
-  },
-  statusBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 3,
+  overdueBadgeText: { fontSize: 10, color: "#B42318", fontWeight: "800" },
+  settledBadge: {
+    backgroundColor: "#D1FADF",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
     borderRadius: 6,
-    backgroundColor: "#F8F9FC",
+    marginLeft: 4,
   },
-  badgeOverdue: { backgroundColor: "#FEE4E2" },
-  badgeRepaid: { backgroundColor: "#D1FADF" },
-  statusText: { color: "#B54708", fontSize: 11, fontWeight: "800" },
-  statusTextOverdue: { color: "#D92D20" },
-  statusTextRepaid: { color: "#079455" },
-  loanActionsRow: { flexDirection: "row", alignItems: "center" },
-  addReceiptBtn: {
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 8,
-    backgroundColor: "#F2F4F7",
-    marginRight: 6,
-  },
-  addReceiptBtnText: { color: "#344054", fontWeight: "700", fontSize: 11 },
-  repayButton: {
-    backgroundColor: "#EFF8FF",
-    borderWidth: 1,
-    borderColor: "#B2DDFF",
-    paddingHorizontal: 12,
-    paddingVertical: 5,
-    borderRadius: 8,
-    minWidth: 84,
-    alignItems: "center",
-  },
-  repayButtonText: { color: "#175CD3", fontWeight: "800", fontSize: 12 },
+  settledBadgeText: { fontSize: 10, color: "#027A48", fontWeight: "800" },
+  friendBalanceColumn: { alignItems: "flex-end", marginLeft: 10 },
+  balanceLabel: { fontSize: 9, fontWeight: "800", color: "#98A2B3", letterSpacing: 0.6 },
+  friendOutstandingAmount: { fontSize: 16, fontWeight: "900", color: "#101828", marginTop: 2 },
+  amountOverdue: { color: "#D92D20" },
+  amountSettled: { color: "#079455" },
+  friendOverdueSubtext: { fontSize: 11, color: "#D92D20", fontWeight: "700", marginTop: 2 },
+  tapToViewText: { fontSize: 10, color: "#1F4FD6", fontWeight: "700", marginTop: 4 },
+
   empty: {
     padding: 36,
     alignItems: "center",
@@ -1685,7 +2235,170 @@ const styles = StyleSheet.create({
   refresh: { padding: 14, alignItems: "center" },
   refreshText: { color: "#1F4FD6", fontWeight: "700", fontSize: 13 },
 
-  // Receipt Modal Styles
+  // Friend Detail Screen Styles (Modal)
+  modalScreen: { flex: 1, backgroundColor: "#F7F9FC" },
+  detailHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 20,
+    paddingBottom: 14,
+    backgroundColor: "white",
+    borderBottomWidth: 1,
+    borderBottomColor: "#EAECF0",
+  },
+  detailTitle: { fontSize: 22, fontWeight: "900", color: "#101828" },
+  detailSubtitle: { fontSize: 12, color: "#667085", marginTop: 2 },
+  profileLoading: { marginTop: 40 },
+  profileContent: { padding: 18 },
+
+  friendSummaryHero: {
+    backgroundColor: "#163AB0",
+    borderRadius: 20,
+    padding: 18,
+    marginBottom: 16,
+  },
+  friendHeroRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  friendHeroLabel: { color: "#C8D5FB", fontSize: 11, fontWeight: "800", letterSpacing: 1 },
+  friendHeroBalance: { color: "white", fontSize: 30, fontWeight: "900", marginTop: 4, marginBottom: 14 },
+  friendHeroGrid: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    borderTopWidth: 1,
+    borderTopColor: "rgba(255,255,255,0.15)",
+    paddingTop: 12,
+  },
+  friendStatLabel: { color: "#B8CBF8", fontSize: 9, fontWeight: "800", letterSpacing: 0.6 },
+  friendStatValue: { color: "white", fontSize: 14, fontWeight: "800", marginTop: 2 },
+  friendStatValueRepaid: { color: "#7CE8B8", fontSize: 14, fontWeight: "800", marginTop: 2 },
+
+  addLoanToFriendBtn: {
+    backgroundColor: "#1F4FD6",
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: "center",
+    marginBottom: 18,
+  },
+  addLoanToFriendText: { color: "white", fontWeight: "800", fontSize: 14 },
+
+  historyTitle: { color: "#101828", fontSize: 17, fontWeight: "800", marginBottom: 12 },
+  emptyHistoryBox: {
+    padding: 24,
+    backgroundColor: "white",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#EAECF0",
+    alignItems: "center",
+  },
+  emptyHistoryText: { color: "#667085", fontSize: 13 },
+
+  loanDetailCard: {
+    backgroundColor: "white",
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#EAECF0",
+  },
+  overdueCard: {
+    borderColor: "#FDA29B",
+    backgroundColor: "#FFFBFA",
+  },
+  repaidCard: {
+    borderColor: "#ABEFC6",
+    backgroundColor: "#F6FEF9",
+  },
+  loanDetailTop: { flexDirection: "row", alignItems: "flex-start" },
+  loanDetailAmount: { fontSize: 18, fontWeight: "900", color: "#101828", marginRight: 8 },
+  loanDetailDates: { fontSize: 12, color: "#667085", marginTop: 4 },
+  loanRemainingText: { fontSize: 13, color: "#475467", marginTop: 4 },
+  customOverdueText: { fontSize: 11, color: "#D92D20", fontWeight: "800", marginTop: 2 },
+
+  receiptPill: {
+    backgroundColor: "#EFF8FF",
+    borderColor: "#B2DDFF",
+    borderWidth: 1,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+    marginLeft: 6,
+  },
+  receiptPillText: { fontSize: 10, color: "#175CD3", fontWeight: "800" },
+
+  statusBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    backgroundColor: "#F8F9FC",
+  },
+  badgeOverdue: { backgroundColor: "#FEE4E2" },
+  badgeRepaid: { backgroundColor: "#D1FADF" },
+  statusText: { color: "#B54708", fontSize: 11, fontWeight: "800" },
+  statusTextOverdue: { color: "#D92D20" },
+  statusTextRepaid: { color: "#079455" },
+
+  repaymentSection: {
+    borderTopWidth: 1,
+    borderTopColor: "#EAECF0",
+    marginTop: 10,
+    paddingTop: 8,
+  },
+  repaymentSectionTitle: { fontSize: 11, fontWeight: "800", color: "#475467", marginBottom: 4 },
+  repaymentRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 3,
+  },
+  repaymentRowAmount: { fontSize: 12, fontWeight: "800", color: "#079455" },
+  repaymentRowDate: { fontSize: 11, color: "#667085" },
+
+  loanActionsBar: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    borderTopWidth: 1,
+    borderTopColor: "#F2F4F7",
+    marginTop: 10,
+    paddingTop: 10,
+  },
+  recordRepayBtn: {
+    backgroundColor: "#1F4FD6",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+    marginRight: 6,
+  },
+  recordRepayBtnText: { color: "white", fontSize: 11, fontWeight: "800" },
+  fullRepayBtn: {
+    backgroundColor: "#EFF8FF",
+    borderWidth: 1,
+    borderColor: "#B2DDFF",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    marginRight: 6,
+  },
+  fullRepayBtnText: { color: "#175CD3", fontSize: 11, fontWeight: "800" },
+  addReceiptBtn: {
+    backgroundColor: "#F2F4F7",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    marginRight: 6,
+  },
+  addReceiptBtnText: { color: "#344054", fontWeight: "700", fontSize: 11 },
+  setOverdueBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: "#FEF3F2",
+    borderColor: "#FECDCA",
+    borderWidth: 1,
+  },
+  setOverdueBtnText: { color: "#B42318", fontWeight: "700", fontSize: 11 },
+
+  // Modals generic
   modalBackdrop: {
     flex: 1,
     backgroundColor: "rgba(0, 0, 0, 0.6)",
@@ -1755,18 +2468,29 @@ const styles = StyleSheet.create({
     marginLeft: "auto",
   },
   modalDoneText: { color: "white", fontSize: 13, fontWeight: "800" },
-
-  // Custom Overdue Amount Styles
-  setOverdueBtn: {
-    paddingHorizontal: 8,
-    paddingVertical: 5,
-    borderRadius: 8,
-    backgroundColor: "#FEF3F2",
-    borderColor: "#FECDCA",
-    borderWidth: 1,
-    marginRight: 6,
-  },
-  setOverdueBtnText: { color: "#B42318", fontWeight: "700", fontSize: 11 },
-  customOverdueText: { fontSize: 11, color: "#D92D20", fontWeight: "800", marginTop: 2 },
   overdueModalHint: { fontSize: 13, color: "#475467", lineHeight: 18, marginBottom: 14 },
+
+  // Duplicate Match Box
+  duplicateMatchBox: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#EFF8FF",
+    borderWidth: 1,
+    borderColor: "#B2DDFF",
+    borderRadius: 12,
+    padding: 12,
+    marginVertical: 4,
+  },
+  duplicateMatchName: { fontSize: 15, fontWeight: "800", color: "#101828" },
+  duplicateMatchPhone: { fontSize: 12, color: "#667085", marginTop: 1 },
+  duplicateMatchBalance: { fontSize: 12, color: "#175CD3", fontWeight: "700", marginTop: 2 },
+  useProfileBtn: {
+    backgroundColor: "#1F4FD6",
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
+    marginLeft: 8,
+  },
+  useProfileBtnText: { color: "white", fontSize: 12, fontWeight: "800" },
 });
