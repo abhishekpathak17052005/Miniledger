@@ -130,7 +130,8 @@ app.post("/api/loans", requireAuth, async (req: AuthRequest, res) => {
 });
 
 app.patch("/api/loans/:id/repay", requireAuth, async (req: AuthRequest, res) => {
-  const existing = await prisma.loan.findFirst({ where: { id: req.params.id, userId: req.userId! } });
+  const loanId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const existing = await prisma.loan.findFirst({ where: { id: loanId, userId: req.userId! } });
   if (!existing) {
     res.status(404).json({ error: "Loan not found" });
     return;
